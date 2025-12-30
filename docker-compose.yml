@@ -1,0 +1,46 @@
+services:
+  coordinator:
+    build:
+      context: ./coordinator
+      dockerfile: Dockerfile
+    container_name: federated-coordinator
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist models directory across restarts
+      - ./coordinator/models:/app/models
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import http.client; conn = http.client.HTTPConnection('localhost', 8000); conn.request('GET', '/'); r = conn.getresponse(); exit(0 if r.status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - federated-network
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    # Don't set container_name to allow scaling
+    environment:
+      - COORDINATOR_URL=http://coordinator:8000
+      - CLIENT_NAME=${CLIENT_NAME:-client}
+      - MAX_RETRIES=3
+      - SLEEP_BETWEEN_ROUNDS=5.0
+      - RETRY_DELAY=2.0
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    networks:
+      - federated-network
+    # Allow clients to exit and restart (simulating unreliable nodes)
+    restart: unless-stopped
+
+networks:
+  federated-network:
+    driver: bridge
+
