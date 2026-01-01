@@ -12,6 +12,7 @@ Orchestrates the client-side federated learning workflow:
 import time
 import sys
 import uuid
+import os
 from typing import Optional
 
 from config import config
@@ -24,6 +25,10 @@ from api import (
     CoordinatorConnectionError
 )
 from trainer import train_local_model_with_client_id
+from utils.logger import setup_client_logger, log_event
+from security import get_api_key, require_api_key, has_api_key
+
+logger = setup_client_logger()
 
 
 def generate_client_name() -> str:
@@ -39,12 +44,29 @@ def generate_client_name() -> str:
     if config.CLIENT_NAME:
         return config.CLIENT_NAME
     
-    # Try to use hostname (useful in Docker containers where hostname = container name)
+    # Try to use hostname from environment (Docker Compose sets HOSTNAME)
+    hostname = os.getenv("HOSTNAME")
+    if hostname and hostname != "localhost":
+        # Clean up hostname - remove common prefixes/suffixes
+        # Docker Compose creates names like "open-federated-trainer-client-1"
+        # Extract just the meaningful part
+        if "client" in hostname.lower():
+            # Extract instance number or use full hostname
+            parts = hostname.split("-")
+            if len(parts) > 1:
+                # Try to find a number in the hostname
+                for part in reversed(parts):
+                    if part.isdigit():
+                        return f"client-{part}"
+            return hostname.replace("open-federated-trainer-", "").replace("-", "_")
+        return hostname
+    
+    # Try to use hostname from socket (fallback)
     try:
         import socket
         hostname = socket.gethostname()
-        if hostname and hostname != "localhost":
-            return hostname
+        if hostname and hostname not in ["localhost", "localhost.localdomain"]:
+            return hostname.replace("-", "_")
     except Exception:
         pass
     
@@ -53,7 +75,7 @@ def generate_client_name() -> str:
     return f"client_{unique_id}"
 
 
-def run_client_loop(client_id: str) -> None:
+def run_client_loop(client_id: str, api_key: Optional[str] = None) -> None:
     """
     Main client execution loop.
     
@@ -65,6 +87,7 @@ def run_client_loop(client_id: str) -> None:
     
     Args:
         client_id: Identifier of the client
+        api_key: API key for authentication
     """
     print(f"[Client {client_id}] Starting federated learning client loop...")
     
@@ -78,9 +101,14 @@ def run_client_loop(client_id: str) -> None:
             # Step 1: Fetch training task
             print(f"[Client {client_id}] Fetching training task...")
             try:
-                task = fetch_task(client_id)
-                print(f"[Client {client_id}] Task received: Round {task['round_id']}, "
-                      f"Model v{task['model_version']}, Task: {task['task']}")
+                task = fetch_task(client_id, api_key=api_key)
+                round_id = task["round_id"]
+                print(f"[Client {client_id}] Task received: Round {round_id}, "
+                      f"Model {task['model_version']}, Task: {task['task']}")
+                log_event(logger, "task_received", client_id=client_id, round_id=round_id, extra_fields={
+                    "model_version": task["model_version"],
+                    "task": task["task"]
+                })
             except CoordinatorConnectionError as e:
                 print(f"[Client {client_id}] Coordinator unavailable: {e}")
                 print(f"[Client {client_id}] Retrying in {config.RETRY_DELAY} seconds...")
@@ -89,12 +117,14 @@ def run_client_loop(client_id: str) -> None:
             except CoordinatorAPIError as e:
                 error_msg = str(e).lower()
                 # Check if client is not registered (404 or similar)
-                if "404" in error_msg or "not found" in error_msg or "not registered" in error_msg:
-                    print(f"[Client {client_id}] Client not registered, attempting to re-register...")
+                if "404" in error_msg or "not found" in error_msg or "not registered" in error_msg or "401" in error_msg or "authentication" in error_msg.lower():
+                    print(f"[Client {client_id}] Client not registered or authentication failed, attempting to re-register...")
                     try:
-                        new_client_id = register_client(client_id)
+                        new_client_id, new_api_key = register_client(client_id)
                         print(f"[Client {client_id}] Re-registered successfully as '{new_client_id}'")
+                        print(f"[Client {client_id}] New API Key: {new_api_key}")
                         client_id = new_client_id  # Update client_id in case it changed
+                        api_key = new_api_key  # Update API key
                         continue  # Retry fetching task
                     except Exception as reg_error:
                         print(f"[Client {client_id}] Re-registration failed: {reg_error}")
@@ -111,9 +141,19 @@ def run_client_loop(client_id: str) -> None:
             
             # Step 2: Perform local training
             print(f"[Client {client_id}] Starting local training for round {round_id}...")
+            training_start_time = time.time()
+            log_event(logger, "training_started", client_id=client_id, round_id=round_id)
+            
             try:
                 weight_delta = train_local_model_with_client_id(task, client_id)
+                training_duration = time.time() - training_start_time
+                update_size_bytes = len(weight_delta.encode('utf-8'))
                 print(f"[Client {client_id}] Training completed. Weight delta: {weight_delta[:50]}...")
+                log_event(logger, "training_completed", client_id=client_id, round_id=round_id, extra_fields={
+                    "training_duration_seconds": training_duration,
+                    "update_size_parameters": len(weight_delta),  # Approximate
+                    "update_size_bytes": update_size_bytes
+                })
             except Exception as e:
                 print(f"[Client {client_id}] Training failed: {e}")
                 print(f"[Client {client_id}] Skipping this round...")
@@ -123,17 +163,31 @@ def run_client_loop(client_id: str) -> None:
             # Step 3: Submit update to coordinator
             print(f"[Client {client_id}] Submitting update for round {round_id}...")
             try:
-                success = submit_update(client_id, round_id, weight_delta)
+                success = submit_update(client_id, round_id, weight_delta, api_key=api_key)
                 if success:
                     print(f"[Client {client_id}] Update submitted successfully for round {round_id}")
+                    log_event(logger, "update_sent", client_id=client_id, round_id=round_id, extra_fields={
+                        "update_size_bytes": len(weight_delta.encode('utf-8'))
+                    })
                 else:
                     print(f"[Client {client_id}] Update submission returned False")
+                    log_event(logger, "update_failed", level="WARNING", client_id=client_id, round_id=round_id, extra_fields={
+                        "reason": "submission_returned_false"
+                    })
             except CoordinatorConnectionError as e:
                 print(f"[Client {client_id}] Coordinator unavailable during update: {e}")
                 print(f"[Client {client_id}] Update may be lost. Continuing...")
+                log_event(logger, "update_failed", level="WARNING", client_id=client_id, round_id=round_id, extra_fields={
+                    "reason": "coordinator_unavailable",
+                    "error": str(e)
+                })
             except CoordinatorAPIError as e:
                 print(f"[Client {client_id}] Failed to submit update: {e}")
                 print(f"[Client {client_id}] Update rejected by coordinator")
+                log_event(logger, "update_failed", level="WARNING", client_id=client_id, round_id=round_id, extra_fields={
+                    "reason": "coordinator_rejected",
+                    "error": str(e)
+                })
             
             # Optional: Check round status
             try:
@@ -178,6 +232,9 @@ def main() -> None:
     try:
         client_id = register_client(client_name)
         print(f"[Registration] Successfully registered as '{client_id}'")
+        log_event(logger, "client_started", client_id=client_id, extra_fields={
+            "coordinator_url": config.COORDINATOR_URL
+        })
     except CoordinatorConnectionError as e:
         print(f"[Registration] ERROR: Cannot connect to coordinator: {e}")
         print(f"[Registration] Please ensure the coordinator is running at {config.COORDINATOR_URL}")
@@ -193,7 +250,7 @@ def main() -> None:
     
     # Step 2: Start the main client loop
     try:
-        run_client_loop(client_id)
+        run_client_loop(client_id, api_key=api_key)
     except KeyboardInterrupt:
         print("\n[Client] Shutdown requested by user")
     except Exception as e:
