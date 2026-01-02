@@ -10,6 +10,7 @@ from typing import Dict, Optional, Any
 from requests.exceptions import RequestException, Timeout, ConnectionError
 
 from config import config
+from security import get_api_key
 
 
 class CoordinatorAPIError(Exception):
@@ -98,15 +99,15 @@ def _make_request(
     raise CoordinatorConnectionError(f"Request failed: {last_exception}")
 
 
-def register_client(client_name: str) -> str:
+def register_client(client_name: str) -> tuple[str, str]:
     """
-    Register a client with the coordinator.
+    Register a client with the coordinator and receive an API key.
     
     Args:
         client_name: Name/identifier for the client
         
     Returns:
-        Client ID (same as client_name)
+        Tuple of (client_id, api_key)
         
     Raises:
         CoordinatorAPIError: If registration fails
@@ -119,17 +120,20 @@ def register_client(client_name: str) -> str:
     data = response.json()
     
     if data.get("success"):
-        return data.get("client_id", client_name)
+        client_id = data.get("client_id", client_name)
+        api_key = data.get("api_key", "")
+        return client_id, api_key
     else:
         raise CoordinatorAPIError(f"Registration failed: {data.get('message', 'Unknown error')}")
 
 
-def fetch_task(client_id: str) -> Dict[str, Any]:
+def fetch_task(client_id: str, api_key: Optional[str] = None) -> Dict[str, Any]:
     """
     Fetch a training task from the coordinator.
     
     Args:
         client_id: Identifier of the client
+        api_key: Optional API key (uses security.get_api_key() if not provided)
         
     Returns:
         Task dictionary with round_id, model_version, task, and description
@@ -138,16 +142,23 @@ def fetch_task(client_id: str) -> Dict[str, Any]:
         CoordinatorAPIError: If task fetch fails
         CoordinatorConnectionError: If connection fails
     """
-    url = f"{config.COORDINATOR_URL}/task/{client_id}"
+    if api_key is None:
+        api_key = get_api_key()
     
-    response = _make_request("GET", url)
+    url = f"{config.COORDINATOR_URL}/task/{client_id}"
+    params = {}
+    if api_key:
+        params["api_key"] = api_key
+    
+    response = _make_request("GET", url, params=params)
     return response.json()
 
 
 def submit_update(
     client_id: str,
     round_id: int,
-    weight_delta: str
+    weight_delta: str,
+    api_key: Optional[str] = None
 ) -> bool:
     """
     Submit a model update to the coordinator.
@@ -156,6 +167,7 @@ def submit_update(
         client_id: Identifier of the client
         round_id: Identifier of the round
         weight_delta: Weight delta update (as string in MVP)
+        api_key: Optional API key (uses security.get_api_key() if not provided)
         
     Returns:
         True if submission was successful
@@ -164,12 +176,17 @@ def submit_update(
         CoordinatorAPIError: If submission fails
         CoordinatorConnectionError: If connection fails
     """
+    if api_key is None:
+        api_key = get_api_key()
+    
     url = f"{config.COORDINATOR_URL}/update"
     payload = {
         "client_id": client_id,
         "round_id": round_id,
         "weight_delta": weight_delta
     }
+    if api_key:
+        payload["api_key"] = api_key
     
     response = _make_request("POST", url, json=payload)
     data = response.json()

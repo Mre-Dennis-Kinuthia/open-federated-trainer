@@ -9,6 +9,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY src/ ./src/
 
+# Set Python path so imports work correctly
+ENV PYTHONPATH=/app/src
+
 # Expose FastAPI port
 EXPOSE 8000
 

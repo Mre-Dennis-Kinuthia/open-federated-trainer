@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from .round_manager import RoundManager, RoundState
 from .model_store import ModelStore
 from .versioning import next_version
+from utils.logger import get_logger
+
+logger = get_logger("aggregator")
 
 
 @dataclass
@@ -26,7 +29,7 @@ class Aggregator:
     Collects updates from clients and performs aggregation.
     """
     
-    def __init__(self, round_manager: RoundManager, model_store: ModelStore = None, task_assigner = None):
+    def __init__(self, round_manager: RoundManager, model_store: ModelStore = None, task_assigner = None, metrics_collector = None, rate_limiter = None):
         """
         Initialize the aggregator.
         
@@ -34,10 +37,14 @@ class Aggregator:
             round_manager: Round manager instance to coordinate with
             model_store: Model store instance for persisting aggregated models
             task_assigner: Optional task assigner to update with new model version
+            metrics_collector: Optional metrics collector for tracking metrics
+            rate_limiter: Optional rate limiter for cleanup
         """
         self.round_manager = round_manager
         self.model_store = model_store or ModelStore()
         self.task_assigner = task_assigner
+        self.metrics_collector = metrics_collector
+        self.rate_limiter = rate_limiter
         self.updates: Dict[int, List[ClientUpdate]] = {}
     
     def submit_update(self, client_id: str, round_id: int, weight_delta: str) -> bool:
@@ -103,6 +110,18 @@ class Aggregator:
         # Update round state to AGGREGATING
         self.round_manager.set_round_state(round_id, RoundState.AGGREGATING)
         
+        # Log aggregation start
+        logger.info(f"Aggregation started for round {round_id}", extra={
+            "component": "coordinator",
+            "event": "aggregation_started",
+            "round_id": round_id,
+            "model_version": round_obj.model_version
+        })
+        
+        # Record metrics
+        if self.metrics_collector:
+            self.metrics_collector.start_aggregation(round_id)
+        
         # Get all updates for this round
         round_updates = self.updates.get(round_id, [])
         
@@ -149,6 +168,24 @@ class Aggregator:
         
         # Mark round as closed after aggregation
         self.round_manager.set_round_state(round_id, RoundState.CLOSED)
+        
+        # Reset rate limiting for this round
+        if self.rate_limiter:
+            self.rate_limiter.reset_round(round_id)
+        
+        # Log aggregation completion
+        logger.info(f"Aggregation completed for round {round_id}", extra={
+            "component": "coordinator",
+            "event": "aggregation_completed",
+            "round_id": round_id,
+            "model_version": new_model_version,
+            "num_updates": len(round_updates)
+        })
+        
+        # Record metrics
+        if self.metrics_collector:
+            self.metrics_collector.complete_aggregation(round_id)
+            self.metrics_collector.end_round(round_id)
         
         return {
             "round_id": round_id,

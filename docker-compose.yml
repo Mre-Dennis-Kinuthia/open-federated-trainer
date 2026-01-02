@@ -27,11 +27,13 @@ services:
     # Don't set container_name to allow scaling
     environment:
       - COORDINATOR_URL=http://coordinator:8000
-      - CLIENT_NAME=${CLIENT_NAME:-client}
+      - CLIENT_NAME=${CLIENT_NAME:-}
       - MAX_RETRIES=3
       - SLEEP_BETWEEN_ROUNDS=5.0
       - RETRY_DELAY=2.0
       - PYTHONUNBUFFERED=1
+      # Docker Compose provides HOSTNAME which will be unique per container
+      - HOSTNAME
     depends_on:
       coordinator:
         condition: service_healthy

@@ -17,7 +17,11 @@ from core.metrics import MetricsCollector
 from core.auth import AuthManager
 from core.rate_limiter import RateLimiter
 from core.privacy import PrivacyProtector
+from core.async_round_manager import AsyncRoundManager, AsyncRoundConfig
+from core.reputation import ReputationManager
+from core.incentives import IncentiveManager
 from utils.logger import setup_coordinator_logger
+import os
 
 # Set up logging
 logger = setup_coordinator_logger()
@@ -49,6 +53,21 @@ update_validator = UpdateValidator(
 )
 metrics_collector = MetricsCollector()
 aggregator = Aggregator(round_manager, model_store, task_assigner, metrics_collector, rate_limiter)
+
+# Initialize advanced modules (optional)
+enable_async = os.getenv("ENABLE_ASYNC_ROUNDS", "false").lower() == "true"
+async_config = AsyncRoundConfig(
+    minimum_updates_required=int(os.getenv("ASYNC_MIN_UPDATES", "2")),
+    max_round_duration_seconds=float(os.getenv("ASYNC_MAX_DURATION", "300.0")),
+    enable_async=enable_async
+)
+async_round_manager = AsyncRoundManager(round_manager, async_config) if enable_async else None
+reputation_manager = ReputationManager()
+incentive_manager = IncentiveManager(
+    base_reward_per_update=float(os.getenv("INCENTIVE_BASE_REWARD", "10.0")),
+    speed_bonus_threshold=float(os.getenv("INCENTIVE_SPEED_THRESHOLD", "30.0")),
+    consistency_bonus_threshold=int(os.getenv("INCENTIVE_CONSISTENCY_THRESHOLD", "5"))
+)
 
 
 # Pydantic models for request/response
@@ -239,6 +258,17 @@ async def submit_update(request: UpdateRequest) -> UpdateResponse:
     Returns:
         Update submission response with success status
     """
+    # Check if round is closed (straggler detection)
+    if async_round_manager and request.round_id in async_round_manager.closed_rounds:
+        # This is a straggler - update arrived after round closed
+        async_round_manager.record_straggler(request.client_id, request.round_id)
+        reputation_manager.record_round_dropout(request.client_id, request.round_id)
+        incentive_manager.record_dropout(request.client_id)
+        raise HTTPException(
+            status_code=410,  # Gone - round already closed
+            detail=f"Round {request.round_id} is already closed. Update arrived too late."
+        )
+    
     # Validate update (includes authentication, rate limiting, value checks)
     is_valid, reason = update_validator.validate(
         request.client_id,
@@ -248,8 +278,9 @@ async def submit_update(request: UpdateRequest) -> UpdateResponse:
     )
     
     if not is_valid:
-        # Record rejected update in metrics
+        # Record rejected update in metrics and reputation
         metrics_collector.record_update_rejected(request.round_id)
+        reputation_manager.record_update_rejected(request.client_id, request.round_id)
         
         # Provide specific error message
         if reason == "authentication_failed":
@@ -271,6 +302,11 @@ async def submit_update(request: UpdateRequest) -> UpdateResponse:
     if rate_limiter:
         rate_limiter.record_update(request.client_id, request.round_id)
     
+    # Calculate latency for reputation and incentives
+    latency = None
+    if async_round_manager and request.round_id in async_round_manager.round_start_times:
+        latency = time.time() - async_round_manager.round_start_times[request.round_id]
+    
     # Submit update to aggregator
     success = aggregator.submit_update(
         request.client_id,
@@ -280,6 +316,7 @@ async def submit_update(request: UpdateRequest) -> UpdateResponse:
     
     if not success:
         metrics_collector.record_update_rejected(request.round_id)
+        reputation_manager.record_update_rejected(request.client_id, request.round_id)
         raise HTTPException(
             status_code=400,
             detail=f"Failed to submit update from client {request.client_id} for round {request.round_id}"
@@ -288,6 +325,23 @@ async def submit_update(request: UpdateRequest) -> UpdateResponse:
     # Record accepted update in metrics
     metrics_collector.record_update_received(request.round_id)
     metrics_collector.record_update_accepted(request.round_id)
+    
+    # Record in reputation system
+    reputation_manager.record_update_submitted(request.client_id, request.round_id)
+    reputation_manager.record_update_accepted(request.client_id, request.round_id)
+    
+    # Award incentives
+    tokens_earned = incentive_manager.award_update_reward(
+        request.client_id,
+        request.round_id,
+        latency_seconds=latency
+    )
+    
+    # Check if round is ready for aggregation (async mode)
+    if async_round_manager and async_round_manager.check_round_ready(request.round_id):
+        # Round is ready - trigger aggregation callback
+        if async_round_manager.on_round_ready:
+            async_round_manager.on_round_ready(request.round_id)
     
     return UpdateResponse(
         success=True,
@@ -433,23 +487,128 @@ async def get_round_metrics(round_id: int) -> Dict[str, Any]:
     return metrics
 
 
+@app.get("/reputation", response_model=Dict[str, Any])
+async def get_all_reputations() -> Dict[str, Any]:
+    """
+    Get all client reputations.
+    
+    Returns:
+        Dictionary mapping client_id to reputation data
+    """
+    return reputation_manager.get_all_reputations()
+
+
+@app.get("/reputation/{client_id}", response_model=Dict[str, Any])
+async def get_client_reputation(client_id: str) -> Dict[str, Any]:
+    """
+    Get reputation for a specific client.
+    
+    Args:
+        client_id: Identifier of the client
+        
+    Returns:
+        Client reputation data
+        
+    Raises:
+        HTTPException: 404 if client not found
+    """
+    rep = reputation_manager.get_reputation(client_id)
+    if rep is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Reputation for client {client_id} not found"
+        )
+    return rep.to_dict()
+
+
+@app.get("/incentives", response_model=Dict[str, Any])
+async def get_all_incentives() -> Dict[str, Any]:
+    """
+    Get all client incentives.
+    
+    Returns:
+        Dictionary mapping client_id to incentive data
+    """
+    return incentive_manager.get_all_incentives()
+
+
+@app.get("/incentives/{client_id}", response_model=Dict[str, Any])
+async def get_client_incentives(client_id: str) -> Dict[str, Any]:
+    """
+    Get incentives for a specific client.
+    
+    Args:
+        client_id: Identifier of the client
+        
+    Returns:
+        Client incentive data
+        
+    Raises:
+        HTTPException: 404 if client not found
+    """
+    incentives = incentive_manager.get_client_incentives(client_id)
+    if incentives is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Incentives for client {client_id} not found"
+        )
+    return incentives.to_dict()
+
+
+@app.get("/async/round/{round_id}/stats", response_model=Dict[str, Any])
+async def get_async_round_stats(round_id: int) -> Dict[str, Any]:
+    """
+    Get async round statistics.
+    
+    Args:
+        round_id: Identifier of the round
+        
+    Returns:
+        Async round statistics
+        
+    Raises:
+        HTTPException: 404 if async mode not enabled or round not found
+    """
+    if not async_round_manager:
+        raise HTTPException(
+            status_code=404,
+            detail="Async round management is not enabled"
+        )
+    
+    stats = async_round_manager.get_round_stats(round_id)
+    if not stats:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Round {round_id} not found"
+        )
+    return stats
+
+
 @app.get("/")
 async def root():
     """Root endpoint with API information."""
+    endpoints = {
+        "register_client": "POST /client/register",
+        "get_task": "GET /task/{client_id}",
+        "submit_update": "POST /update",
+        "aggregate_round": "GET /aggregate/{round_id}",
+        "get_round_status": "GET /status/{round_id}",
+        "get_model": "GET /model/{version}",
+        "get_all_metrics": "GET /metrics",
+        "get_latest_metrics": "GET /metrics/latest",
+        "get_round_metrics": "GET /metrics/round/{round_id}",
+        "get_all_reputations": "GET /reputation",
+        "get_client_reputation": "GET /reputation/{client_id}",
+        "get_all_incentives": "GET /incentives",
+        "get_client_incentives": "GET /incentives/{client_id}",
+        "get_async_round_stats": "GET /async/round/{round_id}/stats"
+    }
+    
     return {
         "message": "Federated Learning Coordinator API",
         "version": "1.0.0",
-        "endpoints": {
-            "register_client": "POST /client/register",
-            "get_task": "GET /task/{client_id}",
-            "submit_update": "POST /update",
-            "aggregate_round": "GET /aggregate/{round_id}",
-            "get_round_status": "GET /status/{round_id}",
-            "get_model": "GET /model/{version}",
-            "get_all_metrics": "GET /metrics",
-            "get_latest_metrics": "GET /metrics/latest",
-            "get_round_metrics": "GET /metrics/round/{round_id}"
-        }
+        "async_enabled": enable_async,
+        "endpoints": endpoints
     }
 
 

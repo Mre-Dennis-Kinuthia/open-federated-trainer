@@ -8,6 +8,10 @@ from enum import Enum
 from typing import Dict, Set, Optional
 from dataclasses import dataclass, field
 
+from utils.logger import get_logger
+
+logger = get_logger("round_manager")
+
 
 class RoundState(Enum):
     """Round state enumeration."""
@@ -52,8 +56,18 @@ class RoundManager:
             True if client was registered, False if already exists
         """
         if client_name in self.clients:
+            logger.warning(f"Client {client_name} already registered", extra={
+                "component": "coordinator",
+                "event": "client_registration_failed",
+                "client_id": client_name
+            })
             return False
         self.clients.add(client_name)
+        logger.info(f"Client {client_name} registered", extra={
+            "component": "coordinator",
+            "event": "client_registered",
+            "client_id": client_name
+        })
         return True
     
     def assign_client_to_round(self, client_id: str, model_version: str) -> Optional[int]:
@@ -106,10 +120,24 @@ class RoundManager:
             # Create new round with specified model version
             active_round = Round(round_id=self.next_round_id, model_version=model_version)
             self.rounds[self.next_round_id] = active_round
+            logger.info(f"Round {self.next_round_id} started", extra={
+                "component": "coordinator",
+                "event": "round_started",
+                "round_id": self.next_round_id,
+                "model_version": model_version
+            })
             self.next_round_id += 1
         
         active_round.assigned_clients.add(client_id)
         self.client_round_assignments[client_id] = active_round.round_id
+        
+        logger.info(f"Client {client_id} assigned to round {active_round.round_id}", extra={
+            "component": "coordinator",
+            "event": "client_assigned",
+            "round_id": active_round.round_id,
+            "client_id": client_id,
+            "model_version": model_version
+        })
         
         if active_round.state == RoundState.OPEN:
             active_round.state = RoundState.COLLECTING
@@ -160,6 +188,14 @@ class RoundManager:
         round_obj = self.rounds[round_id]
         round_obj.updates_received.add(client_id)
         
+        logger.info(f"Update received from client {client_id} for round {round_id}", extra={
+            "component": "coordinator",
+            "event": "update_received",
+            "round_id": round_id,
+            "client_id": client_id,
+            "update_size_bytes": len(weight_delta.encode('utf-8'))
+        })
+        
         return True
     
     def get_round_status(self, round_id: int) -> Optional[Dict]:
@@ -201,6 +237,19 @@ class RoundManager:
         if round_obj is None:
             return False
         
+        old_state = round_obj.state
         round_obj.state = state
+        
+        # Log round completion
+        if state == RoundState.CLOSED:
+            logger.info(f"Round {round_id} completed", extra={
+                "component": "coordinator",
+                "event": "round_completed",
+                "round_id": round_id,
+                "model_version": round_obj.model_version,
+                "total_clients": len(round_obj.assigned_clients),
+                "total_updates": len(round_obj.updates_received)
+            })
+        
         return True
 

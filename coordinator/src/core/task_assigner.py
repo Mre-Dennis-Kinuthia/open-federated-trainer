@@ -8,6 +8,9 @@ from typing import Dict, Optional
 from .round_manager import RoundManager
 from .versioning import initial_version
 from .model_store import ModelStore
+from utils.logger import get_logger
+
+logger = get_logger("task_assigner")
 
 
 class TaskAssigner:
