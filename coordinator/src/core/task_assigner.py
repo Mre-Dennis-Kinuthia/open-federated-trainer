@@ -8,7 +8,7 @@ Supports pluggable model_id + model_config for arbitrary architectures.
 import os
 from typing import Dict, Optional, Any
 from .round_manager import RoundManager
-from .versioning import initial_version
+from .versioning import initial_version, next_version
 from .model_store import ModelStore
 from utils.logger import get_logger
 
@@ -25,18 +25,38 @@ class TaskAssigner:
     def __init__(self, round_manager: RoundManager, model_store: ModelStore = None):
         self.round_manager = round_manager
         self.model_store = model_store or ModelStore()
-        
-        latest_version = self.model_store.latest_model_version()
-        self.model_version: str = latest_version if latest_version else initial_version()
-        
-        self.client_assignments: Dict[str, Dict] = {}
         self.model_id: str = os.getenv("DEFAULT_MODEL_ID", "simple_mlp")
         self.model_config: Dict[str, Any] = {}
+        self.model_version: str = self._version_for_model(self.model_id, None)
+        if self.model_store.model_exists(self.model_version):
+            saved = self.model_store.load_model(self.model_version)
+            self.model_config = saved.get("model_config") or {}
+        self.client_assignments: Dict[str, Dict] = {}
     
     def set_model(self, model_id: str, model_config: Optional[Dict[str, Any]] = None) -> None:
         """Set active architecture for new classic FL assignments."""
         self.model_id = model_id
-        self.model_config = model_config or {}
+        self.model_version = self._version_for_model(model_id, model_config)
+        if model_config is None and self.model_store.model_exists(self.model_version):
+            saved = self.model_store.load_model(self.model_version)
+            self.model_config = saved.get("model_config") or {}
+        else:
+            self.model_config = model_config or {}
+
+    def _version_for_model(
+        self,
+        model_id: str,
+        model_config: Optional[Dict[str, Any]],
+    ) -> str:
+        matching = self.model_store.latest_model_version(
+            model_id=model_id,
+            model_config=model_config,
+            require_weights=True,
+        )
+        if matching:
+            return matching
+        latest_global = self.model_store.latest_model_version()
+        return next_version(latest_global) if latest_global else initial_version()
     
     def assign_task(self, client_id: str) -> Optional[Dict]:
         if client_id not in self.round_manager.clients:

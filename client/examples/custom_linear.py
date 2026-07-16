@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from models import Trainer, TrainResult, register_trainer  # noqa: E402
+from trainer import _load_model_parameters, _model_parameters_to_list  # noqa: E402
 
 
 class CustomLinearTrainer(Trainer):
@@ -42,9 +43,13 @@ class CustomLinearTrainer(Trainer):
         epochs = int(cfg.get("num_epochs", 5))
         lr = float(cfg.get("learning_rate", 0.05))
 
+        torch.manual_seed(int(task.get("model_seed", 0)))
         model = nn.Linear(dim, 1)
+        if task.get("global_weights") is not None:
+            _load_model_parameters(model, task["global_weights"])
         initial = nn.Linear(dim, 1)
         initial.load_state_dict(model.state_dict())
+        base_weights = _model_parameters_to_list(initial)
 
         if dataset is not None and hasattr(dataset, "as_tensors"):
             X, y = dataset.as_tensors(kind="tabular", input_dim=dim)
@@ -73,6 +78,8 @@ class CustomLinearTrainer(Trainer):
             "round_id": task.get("round_id"),
             "model_version": task.get("model_version"),
             "model_id": self.model_id,
+            "model_config": cfg,
+            "base_weights": base_weights,
             "weight_delta": deltas,
             "final_loss": loss_val,
             "training_config": {"num_epochs": epochs, "num_samples": int(X.size(0))},

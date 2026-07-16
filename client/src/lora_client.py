@@ -9,17 +9,16 @@ import time
 import sys
 import os
 from typing import Optional
-from pathlib import Path
 
 from config import config
 from api import (
+    download_lora_adapter,
     register_client,
     get_lora_round,
     CoordinatorAPIError,
     CoordinatorConnectionError
 )
 from training import train_lora_adapter, load_local_dataset
-from training.lora_trainer import LoRATrainer
 from submit import upload_adapter
 from utils.logger import setup_client_logger, log_event
 from security import get_api_key, save_api_key
@@ -75,18 +74,25 @@ def run_lora_client_loop(
         training_start_time = time.time()
         
         try:
-            # Check if previous adapter exists
-            previous_adapter_path = None
-            if round_config.get("adapter_version"):
-                # In production, download previous adapter from coordinator
-                # For MVP, we start fresh each time
-                pass
+            previous_adapter_state = None
+            previous_version = round_config.get("adapter_version")
+            if previous_version:
+                previous = download_lora_adapter(
+                    previous_version,
+                    client_id,
+                    api_key=api_key,
+                )
+                previous_adapter_state = previous.get("adapter_state_dict")
+                if not previous_adapter_state:
+                    raise ValueError(
+                        f"Adapter {previous_version} has no state dictionary"
+                    )
             
             adapter_state_dict, metrics = train_lora_adapter(
                 base_model_name=base_model_name,
                 texts=texts,
                 round_config=round_config,
-                previous_adapter_path=previous_adapter_path
+                previous_adapter_state=previous_adapter_state,
             )
             
             training_duration = time.time() - training_start_time

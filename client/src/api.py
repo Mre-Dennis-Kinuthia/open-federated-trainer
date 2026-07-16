@@ -154,6 +154,19 @@ def fetch_task(client_id: str, api_key: Optional[str] = None) -> Dict[str, Any]:
     return response.json()
 
 
+def fetch_global_model(version: str) -> Optional[Dict[str, Any]]:
+    """Fetch a classic global model, returning None for an initial version."""
+    url = f"{config.COORDINATOR_URL}/model/{version}"
+    try:
+        response = _make_request("GET", url)
+    except CoordinatorAPIError as exc:
+        if "404" in str(exc):
+            return None
+        raise
+    data = response.json()
+    return data.get("model_data")
+
+
 def submit_update(
     client_id: str,
     round_id: int,
@@ -240,6 +253,22 @@ def get_lora_round(round_id: int, api_key: Optional[str] = None) -> Dict[str, An
     if api_key:
         params["api_key"] = api_key
     
+    response = _make_request("GET", url, params=params)
+    return response.json()
+
+
+def download_lora_adapter(
+    version: str,
+    client_id: str,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Download a previous aggregated LoRA adapter state."""
+    if api_key is None:
+        api_key = get_api_key()
+    url = f"{config.COORDINATOR_URL}/adapters/{version}"
+    params: Dict[str, Any] = {"client_id": client_id}
+    if api_key:
+        params["api_key"] = api_key
     response = _make_request("GET", url, params=params)
     return response.json()
 

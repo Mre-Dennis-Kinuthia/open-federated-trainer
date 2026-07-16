@@ -7,6 +7,7 @@ source venv/bin/activate
 export ENABLE_ASYNC_ROUNDS="${ENABLE_ASYNC_ROUNDS:-true}"
 export ASYNC_MIN_UPDATES="${ASYNC_MIN_UPDATES:-2}"
 export ASYNC_MAX_DURATION="${ASYNC_MAX_DURATION:-300}"
+export ENABLE_LOCAL_LAUNCHER="${ENABLE_LOCAL_LAUNCHER:-true}"
 
 cd src
 python main.py

@@ -46,17 +46,3 @@ export function Sparkline({ seriesA, seriesB, height = 120 }: SparkProps) {
     </svg>
   );
 }
-
-/** Build a short synthetic history from a live counter for chart presence. */
-export function historyFromValue(value: number, points = 24): number[] {
-  const out: number[] = [];
-  let v = Math.max(0, value * 0.4);
-  for (let i = 0; i < points; i++) {
-    const t = i / (points - 1);
-    const wobble = Math.sin(i * 0.7) * value * 0.08;
-    v = value * (0.35 + 0.65 * t) + wobble;
-    out.push(Math.max(0, v));
-  }
-  out[out.length - 1] = value;
-  return out;
-}

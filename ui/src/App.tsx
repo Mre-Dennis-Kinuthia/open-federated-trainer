@@ -18,7 +18,7 @@ import { JobsPanel } from "./components/JobsPanel";
 import { LaunchPanel } from "./components/LaunchPanel";
 import { LoraPanel } from "./components/LoraPanel";
 import { RoundsTable } from "./components/RoundsTable";
-import { historyFromValue, Sparkline } from "./components/Sparkline";
+import { Sparkline } from "./components/Sparkline";
 
 type Tab = "overview" | "launch" | "rounds" | "clients" | "lora" | "jobs";
 
@@ -176,6 +176,7 @@ export default function App() {
     count: number;
     modelId: string;
     datasetPreset: string;
+    datasetPath?: string;
   }) {
     setLaunchBusy(true);
     try {
@@ -184,6 +185,7 @@ export default function App() {
         count: opts.count,
         model_id: opts.modelId,
         dataset_preset: opts.datasetPreset,
+        dataset_path: opts.datasetPath,
         set_active_model: true,
       });
       setToast(`Started ${opts.count} train client(s)`);
@@ -198,6 +200,7 @@ export default function App() {
   async function handleStartWorker(opts: {
     jobTypes: string;
     datasetPreset: string;
+    datasetPath?: string;
     enqueueSample: boolean;
   }) {
     setLaunchBusy(true);
@@ -207,6 +210,7 @@ export default function App() {
         count: 1,
         job_types: opts.jobTypes,
         dataset_preset: opts.datasetPreset,
+        dataset_path: opts.datasetPath,
         enqueue_sample_job: opts.enqueueSample,
       });
       setToast("Started job worker");
@@ -253,15 +257,18 @@ export default function App() {
     (r) => r.state === "COLLECTING" || r.state === "OPEN"
   ).length;
 
-  const sparkRounds = useMemo(() => historyFromValue(Number(rounds) || 1), [rounds]);
-  const sparkClients = useMemo(
-    () => historyFromValue(Number(clients) || 1, 24).map((v, i) => v * (0.7 + (i % 5) * 0.05)),
-    [clients]
+  const roundHistory = useMemo(
+    () => [...(data?.classic_rounds ?? [])].reverse(),
+    [data?.classic_rounds]
   );
-  const sparkUpdates = useMemo(() => {
-    const accepted = Number(latest.updates_accepted ?? 0);
-    return historyFromValue(Math.max(accepted, clients * 2, 1));
-  }, [latest.updates_accepted, clients]);
+  const sparkRounds = roundHistory.map((round) => Number(round.total_updates) || 0);
+  const sparkClients = roundHistory.map((round) => Number(round.total_clients) || 0);
+  const sparkAccepted = roundHistory.map(
+    (round) => Number(round.metrics?.updates_accepted) || 0
+  );
+  const sparkReceived = roundHistory.map(
+    (round) => Number(round.metrics?.updates_received) || round.total_updates || 0
+  );
 
   let lastSection: string | undefined;
 
@@ -454,7 +461,7 @@ export default function App() {
                   <div className="card-bd">
                     <div className="legend">
                       <span>
-                        <i className="dot blue" /> Rounds
+                        <i className="dot blue" /> Updates
                       </span>
                       <span>
                         <i className="dot orange" /> Clients
@@ -479,12 +486,12 @@ export default function App() {
                         <i className="dot blue" /> Accepted
                       </span>
                       <span>
-                        <i className="dot teal" /> Baseline
+                        <i className="dot teal" /> Received
                       </span>
                     </div>
                     <Sparkline
-                      seriesA={sparkUpdates}
-                      seriesB={sparkUpdates.map((v) => v * 0.55)}
+                      seriesA={sparkAccepted}
+                      seriesB={sparkReceived}
                     />
                   </div>
                 </div>
@@ -589,6 +596,7 @@ export default function App() {
           {tab === "lora" && (
             <LoraPanel
               baseModels={data?.lora_base_models ?? []}
+              adapterVersions={data?.lora_adapters ?? []}
               rounds={data?.lora_rounds ?? []}
               busyId={busyLora}
               creating={creating}

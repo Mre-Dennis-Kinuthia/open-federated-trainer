@@ -3,6 +3,7 @@ import type { CreateLoraPayload, LoraRound } from "../api";
 
 type Props = {
   baseModels: string[];
+  adapterVersions: string[];
   rounds: LoraRound[];
   busyId: number | null;
   creating: boolean;
@@ -12,6 +13,7 @@ type Props = {
 
 export function LoraPanel({
   baseModels,
+  adapterVersions,
   rounds,
   busyId,
   creating,
@@ -21,6 +23,7 @@ export function LoraPanel({
   const models = baseModels.length > 0 ? baseModels : ["tiny-llama"];
   const [form, setForm] = useState<CreateLoraPayload>({
     base_model_id: models[0],
+    adapter_version: "",
     lora_r: 8,
     lora_alpha: 16,
     max_steps: 50,
@@ -69,6 +72,26 @@ export function LoraPanel({
                     setForm((f) => ({ ...f, lora_r: Number(e.target.value) }))
                   }
                 />
+              </div>
+              <div className="field">
+                <label htmlFor="adapter_version">Continue adapter</label>
+                <select
+                  id="adapter_version"
+                  value={form.adapter_version ?? ""}
+                  onChange={(e) =>
+                    setForm((f) => ({
+                      ...f,
+                      adapter_version: e.target.value || undefined,
+                    }))
+                  }
+                >
+                  <option value="">Start fresh</option>
+                  {adapterVersions.map((version) => (
+                    <option key={version} value={version}>
+                      {version}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div className="field">
                 <label htmlFor="lora_alpha">LoRA alpha</label>

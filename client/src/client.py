@@ -19,6 +19,7 @@ from config import config
 from api import (
     register_client,
     fetch_task,
+    fetch_global_model,
     submit_update,
     get_round_status,
     claim_job,
@@ -27,7 +28,7 @@ from api import (
     CoordinatorConnectionError
 )
 from models import get_trainer
-from datasets import load_local_dataset
+from private_datasets import load_local_dataset
 from jobs import run_job
 from utils.logger import setup_client_logger, log_event
 from behavior import (
@@ -165,6 +166,20 @@ def run_client_loop(client_id: str, api_key: Optional[str] = None) -> None:
             log_event(logger, "training_started", client_id=client_id, round_id=round_id)
             
             try:
+                global_model = fetch_global_model(task["model_version"])
+                if global_model is not None:
+                    stored_model_id = global_model.get("model_id", "simple_mlp")
+                    if stored_model_id != model_id:
+                        raise ValueError(
+                            f"Coordinator model {task['model_version']} is "
+                            f"{stored_model_id}, not {model_id}"
+                        )
+                    weights = global_model.get("weights")
+                    if not weights:
+                        raise ValueError(
+                            f"Coordinator model {task['model_version']} has no global weights"
+                        )
+                    task["global_weights"] = weights
                 dataset = load_local_dataset(
                     path=config.DATASET_PATH,
                     fmt=config.DATASET_FORMAT,

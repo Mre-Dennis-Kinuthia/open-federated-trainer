@@ -115,18 +115,9 @@ class SimpleMLPTrainer(Trainer):
 
         cfg = task.get("model_config") or {}
         input_dim = int(cfg.get("input_dim", 10))
-        data = None
-        # Prefer private local tensors when a real dataset is loaded
-        if (
-            dataset is not None
-            and hasattr(dataset, "as_tensors")
-            and getattr(dataset, "source", "synthetic") != "synthetic"
-        ):
-            data = dataset.as_tensors(kind="tabular", input_dim=input_dim)
-        elif dataset is not None and getattr(dataset, "num_samples", 0):
-            # synthetic fallback still uses derived tensors when available
-            if hasattr(dataset, "as_tensors"):
-                data = dataset.as_tensors(kind="tabular", input_dim=input_dim)
+        if dataset is None or not hasattr(dataset, "as_tensors"):
+            raise ValueError("simple_mlp requires a configured local dataset")
+        data = dataset.as_tensors(kind="tabular", input_dim=input_dim)
 
         weight_delta = train_local_model(
             task,
@@ -139,6 +130,7 @@ class SimpleMLPTrainer(Trainer):
             hidden_dim=int(cfg.get("hidden_dim", 32)),
             output_dim=int(cfg.get("output_dim", 1)),
             data=data,
+            global_weights=task.get("global_weights"),
         )
         try:
             payload = json.loads(weight_delta)
@@ -160,7 +152,7 @@ register_trainer("simple_mlp", SimpleMLPTrainer)
 
 class TinyCNNTrainer(Trainer):
     """
-    Minimal CNN-style trainer for tabular/fake image patches.
+    Minimal CNN trainer for class-folder image datasets.
     Demonstrates a second built-in architecture beyond MLP.
     """
 
@@ -175,6 +167,7 @@ class TinyCNNTrainer(Trainer):
         import torch
         import torch.nn as nn
         import torch.optim as optim
+        from trainer import _load_model_parameters, _model_parameters_to_list
 
         cfg = task.get("model_config") or {}
         channels = int(cfg.get("channels", 1))
@@ -194,17 +187,22 @@ class TinyCNNTrainer(Trainer):
                 x = x.view(x.size(0), -1)
                 return self.fc(x)
 
+        torch.manual_seed(int(task.get("model_seed", 0)))
         model = TinyCNN()
+        if task.get("global_weights") is not None:
+            _load_model_parameters(model, task["global_weights"])
         initial = TinyCNN()
         initial.load_state_dict(model.state_dict())
+        base_weights = _model_parameters_to_list(initial)
 
-        # Prefer dataset samples; else synthetic
-        if dataset is not None and hasattr(dataset, "as_tensors"):
-            X, y = dataset.as_tensors(kind="image", channels=channels, size=size)
-        else:
-            n = int(cfg.get("num_samples", 64))
-            X = torch.randn(n, channels, size, size)
-            y = torch.randint(0, num_classes, (n,))
+        if dataset is None or not hasattr(dataset, "as_tensors"):
+            raise ValueError("tiny_cnn requires a configured image dataset")
+        X, y = dataset.as_tensors(kind="image", channels=channels, size=size)
+        if int(y.min()) < 0 or int(y.max()) >= num_classes:
+            raise ValueError(
+                f"Image labels must be in [0, {num_classes - 1}]; "
+                f"found [{int(y.min())}, {int(y.max())}]"
+            )
 
         opt = optim.Adam(model.parameters(), lr=lr)
         crit = nn.CrossEntropyLoss()
@@ -227,6 +225,8 @@ class TinyCNNTrainer(Trainer):
             "round_id": task.get("round_id"),
             "model_version": task.get("model_version"),
             "model_id": self.model_id,
+            "model_config": cfg,
+            "base_weights": base_weights,
             "weight_delta": deltas,
             "final_loss": loss_val,
             "training_config": {"num_epochs": epochs, "num_samples": int(X.size(0))},

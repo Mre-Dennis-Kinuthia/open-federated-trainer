@@ -30,10 +30,12 @@ type Props = {
     count: number;
     modelId: string;
     datasetPreset: string;
+    datasetPath?: string;
   }) => Promise<void>;
   onStartWorker: (opts: {
     jobTypes: string;
     datasetPreset: string;
+    datasetPath?: string;
     enqueueSample: boolean;
   }) => Promise<void>;
   onStartDemo: (opts: {
@@ -56,8 +58,9 @@ export function LaunchPanel({
   onStop,
   onStopAll,
 }: Props) {
-  const [modelId, setModelId] = useState(activeModel || models[0] || "tiny_cnn");
+  const [modelId, setModelId] = useState(activeModel || models[0] || "simple_mlp");
   const [datasetPreset, setDatasetPreset] = useState("sample_private");
+  const [datasetPath, setDatasetPath] = useState("");
   const [trainCount, setTrainCount] = useState(2);
   const [jobTypes, setJobTypes] = useState("inference,label,compute");
 
@@ -83,8 +86,8 @@ export function LaunchPanel({
         </div>
         <div className="card-bd">
           <p className="help">
-            Sets the active model, starts train clients on a private sample dataset, starts a job
-            worker, and enqueues a compute job.
+            Demo mode uses the repository sample dataset. For real workloads, use
+            the train and worker controls below with a dataset path.
           </p>
           <div className="form-grid">
             <div className="field">
@@ -206,6 +209,15 @@ export function LaunchPanel({
                   onChange={(e) => setTrainCount(Number(e.target.value) || 1)}
                 />
               </div>
+              <div className="field">
+                <label htmlFor="train-path">Real dataset path under client/</label>
+                <input
+                  id="train-path"
+                  value={datasetPath}
+                  onChange={(e) => setDatasetPath(e.target.value)}
+                  placeholder="data/private/train.csv"
+                />
+              </div>
             </div>
             <button
               type="button"
@@ -215,7 +227,8 @@ export function LaunchPanel({
                 void onStartTrain({
                   count: trainCount,
                   modelId,
-                  datasetPreset,
+                  datasetPreset: datasetPath ? "none" : datasetPreset,
+                  datasetPath: datasetPath || undefined,
                 })
               }
             >
@@ -253,6 +266,15 @@ export function LaunchPanel({
                   ))}
                 </select>
               </div>
+              <div className="field">
+                <label htmlFor="worker-path">Real dataset path under client/</label>
+                <input
+                  id="worker-path"
+                  value={datasetPath}
+                  onChange={(e) => setDatasetPath(e.target.value)}
+                  placeholder="data/private/labels.jsonl"
+                />
+              </div>
             </div>
             <button
               type="button"
@@ -261,7 +283,8 @@ export function LaunchPanel({
               onClick={() =>
                 void onStartWorker({
                   jobTypes,
-                  datasetPreset,
+                  datasetPreset: datasetPath ? "none" : datasetPreset,
+                  datasetPath: datasetPath || undefined,
                   enqueueSample: true,
                 })
               }

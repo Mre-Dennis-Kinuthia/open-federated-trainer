@@ -116,19 +116,31 @@ def aggregate_lora_adapters(
         "num_adapters": len(valid_submissions)
     })
     
-    # Get all parameter keys (should be consistent across adapters)
-    first_client = list(valid_submissions.keys())[0]
+    # Require matching parameter names and shapes.
+    first_client = next(iter(valid_submissions))
     first_adapter = valid_submissions[first_client]["adapter_state_dict"]
     param_keys = list(first_adapter.keys())
-    
-    # Verify all adapters have the same keys
+    expected_shapes = {
+        key: tuple(torch.as_tensor(value).shape)
+        for key, value in first_adapter.items()
+    }
+    compatible_submissions = {}
     for client_id, submission in valid_submissions.items():
-        adapter_keys = set(submission["adapter_state_dict"].keys())
-        if adapter_keys != set(param_keys):
-            logger.warning(f"Client {client_id} adapter has mismatched keys")
-            logger.warning(f"Expected: {set(param_keys)}, Got: {adapter_keys}")
-            # Remove from valid submissions
-            del valid_submissions[client_id]
+        adapter = submission["adapter_state_dict"]
+        actual_shapes = {
+            key: tuple(torch.as_tensor(value).shape)
+            for key, value in adapter.items()
+        }
+        if set(adapter) != set(param_keys) or actual_shapes != expected_shapes:
+            logger.warning(
+                f"Client {client_id} adapter has mismatched keys or shapes"
+            )
+            continue
+        if weight_by_samples and int(submission.get("num_samples", 0)) <= 0:
+            logger.warning(f"Client {client_id} has invalid num_samples")
+            continue
+        compatible_submissions[client_id] = submission
+    valid_submissions = compatible_submissions
     
     if not valid_submissions:
         logger.error("No valid adapters after key validation")
@@ -136,7 +148,6 @@ def aggregate_lora_adapters(
     
     # Aggregate each parameter
     aggregated_adapter = {}
-    total_samples = 0
     
     for param_key in param_keys:
         # Collect all values for this parameter
@@ -161,7 +172,6 @@ def aggregate_lora_adapters(
             if weight_by_samples:
                 num_samples = submission.get("num_samples", 1)
                 sample_weights.append(num_samples)
-                total_samples += num_samples
             else:
                 sample_weights.append(1.0)
         
@@ -170,8 +180,9 @@ def aggregate_lora_adapters(
             continue
         
         # Normalize weights
-        if weight_by_samples and total_samples > 0:
-            weights = [w / total_samples for w in sample_weights]
+        total_weight = sum(sample_weights)
+        if weight_by_samples and total_weight > 0:
+            weights = [w / total_weight for w in sample_weights]
         else:
             # Uniform weighting
             uniform_weight = 1.0 / len(sample_weights)

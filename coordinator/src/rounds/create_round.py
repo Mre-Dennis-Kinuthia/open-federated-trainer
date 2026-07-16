@@ -4,9 +4,12 @@ Create LoRA Training Round
 Creates a new federated learning round for LoRA fine-tuning.
 """
 
+import json
+import os
 from typing import Dict, Optional
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from utils.logger import get_logger
 
 logger = get_logger("rounds")
@@ -28,7 +31,9 @@ class LoRARoundConfig:
     gradient_accumulation_steps: int = 4  # Gradient accumulation
     warmup_steps: int = 10  # Warmup steps
     max_seq_length: int = 512  # Maximum sequence length
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
     state: str = "OPEN"  # OPEN, COLLECTING, AGGREGATING, CLOSED
 
 
@@ -39,11 +44,56 @@ class LoRARoundManager:
     Extends the base round manager with LoRA-specific configuration.
     """
     
-    def __init__(self):
+    def __init__(self, state_path: Optional[str] = None):
         """Initialize the LoRA round manager."""
         self.rounds: Dict[int, LoRARoundConfig] = {}
         self.next_round_id: int = 1
         self.adapter_submissions: Dict[int, Dict[str, Dict]] = {}  # round_id -> client_id -> submission
+        default_path = Path(__file__).resolve().parents[2] / "data" / "lora_rounds.json"
+        self.state_path = Path(
+            state_path or os.getenv("LORA_STATE_PATH", str(default_path))
+        )
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._load()
+
+    def _load(self) -> None:
+        if not self.state_path.exists():
+            return
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.next_round_id = int(raw.get("next_round_id", 1))
+            self.rounds = {
+                int(round_id): LoRARoundConfig(**config)
+                for round_id, config in raw.get("rounds", {}).items()
+            }
+            self.adapter_submissions = {
+                int(round_id): submissions
+                for round_id, submissions in raw.get("adapter_submissions", {}).items()
+            }
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Cannot load LoRA state {self.state_path}: {exc}"
+            ) from exc
+
+    def _persist(self) -> None:
+        payload = {
+            "version": 1,
+            "next_round_id": self.next_round_id,
+            "rounds": {
+                str(round_id): asdict(config)
+                for round_id, config in self.rounds.items()
+            },
+            "adapter_submissions": {
+                str(round_id): submissions
+                for round_id, submissions in self.adapter_submissions.items()
+            },
+        }
+        temporary = self.state_path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.state_path)
     
     def create_round(
         self,
@@ -104,6 +154,7 @@ class LoRARoundManager:
         
         self.rounds[round_id] = config
         self.adapter_submissions[round_id] = {}
+        self._persist()
         
         logger.info(f"Created LoRA round {round_id} for base model {base_model_id}", extra={
             "component": "rounds",
@@ -185,6 +236,12 @@ class LoRARoundManager:
         if round_id not in self.rounds:
             logger.warning(f"Round {round_id} not found")
             return False
+        if self.rounds[round_id].state not in {"OPEN", "COLLECTING"}:
+            logger.warning(
+                f"Round {round_id} does not accept submissions in "
+                f"state {self.rounds[round_id].state}"
+            )
+            return False
         
         if round_id not in self.adapter_submissions:
             self.adapter_submissions[round_id] = {}
@@ -194,12 +251,13 @@ class LoRARoundManager:
             "num_samples": num_samples,
             "training_loss": training_loss,
             "adapter_hash": adapter_hash,
-            "submitted_at": datetime.utcnow().isoformat()
+            "submitted_at": datetime.now(timezone.utc).isoformat()
         }
         
         # Update round state
         if self.rounds[round_id].state == "OPEN":
             self.rounds[round_id].state = "COLLECTING"
+        self._persist()
         
         logger.info(f"Adapter submitted for round {round_id} by client {client_id}", extra={
             "component": "rounds",
@@ -237,11 +295,21 @@ class LoRARoundManager:
             return False
         
         self.rounds[round_id].state = "CLOSED"
+        self._persist()
         logger.info(f"Closed LoRA round {round_id}", extra={
             "component": "rounds",
             "event": "lora_round_closed",
             "round_id": round_id
         })
+        return True
+
+    def set_state(self, round_id: int, state: str) -> bool:
+        if round_id not in self.rounds:
+            return False
+        if state not in {"OPEN", "COLLECTING", "AGGREGATING", "CLOSED"}:
+            raise ValueError(f"Invalid LoRA round state: {state}")
+        self.rounds[round_id].state = state
+        self._persist()
         return True
 
 

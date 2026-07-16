@@ -17,9 +17,14 @@ try:
         Trainer,
         DataCollatorForLanguageModeling
     )
-    from peft import LoraConfig, get_peft_model, PeftModel, TaskType
+    from peft import (
+        LoraConfig,
+        TaskType,
+        get_peft_model,
+        get_peft_model_state_dict,
+        set_peft_model_state_dict,
+    )
     from peft import prepare_model_for_kbit_training
-    import bitsandbytes as bnb
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
@@ -81,19 +86,20 @@ class LoRATrainer:
         self.tokenizer = None
         self.peft_model = None
     
-    def load_model(self, previous_adapter_path: Optional[str] = None):
+    def load_model(self, previous_adapter_state: Optional[Dict] = None):
         """
         Load base model and initialize LoRA adapters.
         
         Args:
-            previous_adapter_path: Path to previous adapter (optional)
+            previous_adapter_state: Previous aggregated adapter weights
         """
         logger.info(f"Loading base model: {self.base_model_name}")
         
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.base_model_name,
-            trust_remote_code=True
+            trust_remote_code=os.getenv("TRUST_REMOTE_MODEL_CODE", "false").lower()
+            in {"1", "true", "yes"}
         )
         
         if self.tokenizer.pad_token is None:
@@ -106,7 +112,7 @@ class LoRATrainer:
                     self.base_model_name,
                     load_in_4bit=True,
                     device_map=self.device_map,
-                    trust_remote_code=True,
+                    trust_remote_code=False,
                     torch_dtype=torch.float16
                 )
                 logger.info("Loaded model in 4-bit mode")
@@ -115,7 +121,7 @@ class LoRATrainer:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.base_model_name,
                     device_map="cpu",
-                    trust_remote_code=True,
+                    trust_remote_code=False,
                     torch_dtype=torch.float32
                 )
                 self.use_4bit = False
@@ -123,7 +129,7 @@ class LoRATrainer:
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.base_model_name,
                 device_map=self.device_map,
-                trust_remote_code=True,
+                trust_remote_code=False,
                 torch_dtype=torch.float32
             )
         
@@ -141,17 +147,20 @@ class LoRATrainer:
             task_type=TaskType.CAUSAL_LM
         )
         
-        # Apply LoRA
-        if previous_adapter_path and os.path.exists(previous_adapter_path):
-            # Load previous adapter
-            self.peft_model = PeftModel.from_pretrained(
-                self.model,
-                previous_adapter_path
-            )
-            logger.info(f"Loaded previous adapter from {previous_adapter_path}")
+        self.peft_model = get_peft_model(self.model, lora_config)
+        if previous_adapter_state:
+            state = {
+                key: torch.tensor(value)
+                for key, value in previous_adapter_state.items()
+            }
+            load_result = set_peft_model_state_dict(self.peft_model, state)
+            unexpected = getattr(load_result, "unexpected_keys", [])
+            if unexpected:
+                raise ValueError(
+                    f"Previous adapter has unexpected keys: {unexpected[:5]}"
+                )
+            logger.info("Loaded previous aggregated adapter weights")
         else:
-            # Initialize new LoRA adapters
-            self.peft_model = get_peft_model(self.model, lora_config)
             logger.info("Initialized new LoRA adapters")
         
         # Enable gradient checkpointing for memory efficiency
@@ -210,6 +219,18 @@ class LoRATrainer:
                 return len(self.encodings['input_ids'])
         
         dataset = TextDataset(tokenized)
+        if len(dataset) < 2:
+            raise ValueError("LoRA training requires at least two text samples")
+        eval_size = max(1, min(len(dataset) // 10, 64))
+        train_size = len(dataset) - eval_size
+        generator = torch.Generator().manual_seed(
+            int(os.getenv("LORA_DATASET_SEED", "42"))
+        )
+        train_dataset, eval_dataset = torch.utils.data.random_split(
+            dataset,
+            [train_size, eval_size],
+            generator=generator,
+        )
         data_collator = DataCollatorForLanguageModeling(
             tokenizer=self.tokenizer,
             mlm=False
@@ -234,21 +255,22 @@ class LoRATrainer:
         trainer = Trainer(
             model=self.peft_model,
             args=training_args,
-            train_dataset=dataset,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
             data_collator=data_collator,
         )
         
         # Get initial loss
-        initial_loss = trainer.evaluate()['eval_loss'] if hasattr(trainer, 'evaluate') else 0.0
+        initial_loss = float(trainer.evaluate()["eval_loss"])
         
         # Train
         train_result = trainer.train()
         
         # Get final loss
-        final_loss = train_result.training_loss if hasattr(train_result, 'training_loss') else 0.0
+        final_loss = float(trainer.evaluate()["eval_loss"])
         
         # Extract adapter weights
-        adapter_state_dict = self.peft_model.get_peft_model_state_dict()
+        adapter_state_dict = get_peft_model_state_dict(self.peft_model)
         
         # Convert tensors to lists for JSON serialization
         serialized_adapter = {}
@@ -273,7 +295,7 @@ def train_lora_adapter(
     base_model_name: str,
     texts: list[str],
     round_config: Dict,
-    previous_adapter_path: Optional[str] = None
+    previous_adapter_state: Optional[Dict] = None
 ) -> Tuple[Dict, TrainingMetrics]:
     """
     Train a LoRA adapter for federated learning.
@@ -284,7 +306,7 @@ def train_lora_adapter(
         base_model_name: HuggingFace model identifier
         texts: List of training texts
         round_config: Round configuration from coordinator
-        previous_adapter_path: Path to previous adapter (optional)
+        previous_adapter_state: Previous aggregated adapter weights (optional)
         
     Returns:
         Tuple of (adapter_state_dict, training_metrics)
@@ -298,7 +320,7 @@ def train_lora_adapter(
         max_seq_length=round_config.get("max_seq_length", 512)
     )
     
-    trainer.load_model(previous_adapter_path)
+    trainer.load_model(previous_adapter_state)
     
     adapter, metrics = trainer.train(
         texts=texts,

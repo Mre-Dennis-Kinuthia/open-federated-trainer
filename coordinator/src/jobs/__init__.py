@@ -10,11 +10,14 @@ Job types:
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 
@@ -46,18 +49,56 @@ class Job:
     completed_at: Optional[float] = None
     priority: int = 0
     tags: List[str] = field(default_factory=list)
+    attempts: int = 0
+    max_attempts: int = 3
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
 class JobQueue:
-    """In-memory job queue with lease-style assignment."""
+    """Durable local job queue with lease-style assignment."""
 
-    def __init__(self, lease_seconds: float = 300.0):
+    def __init__(
+        self,
+        lease_seconds: float = 300.0,
+        state_path: Optional[str] = None,
+    ):
         self.jobs: Dict[str, Job] = {}
         self.lease_seconds = lease_seconds
         self._lock = threading.RLock()
+        default_path = Path(__file__).resolve().parents[2] / "data" / "jobs.json"
+        self.state_path = Path(
+            state_path or os.getenv("JOB_QUEUE_STATE_PATH", str(default_path))
+        )
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._load()
+
+    def _load(self) -> None:
+        if not self.state_path.exists():
+            return
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            for value in raw.get("jobs", []):
+                job = Job(**value)
+                self.jobs[job.job_id] = job
+            self._reclaim_expired()
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Cannot load job queue state {self.state_path}: {exc}"
+            ) from exc
+
+    def _persist(self) -> None:
+        payload = {
+            "version": 1,
+            "jobs": [job.to_dict() for job in self.jobs.values()],
+        }
+        temporary = self.state_path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.state_path)
 
     def create_job(
         self,
@@ -66,30 +107,47 @@ class JobQueue:
         priority: int = 0,
         tags: Optional[List[str]] = None,
         job_id: Optional[str] = None,
+        max_attempts: int = 3,
     ) -> Job:
         with self._lock:
+            if job_type not in {item.value for item in JobType}:
+                raise ValueError(f"Unsupported job type: {job_type}")
             jid = job_id or str(uuid.uuid4())
+            if jid in self.jobs:
+                raise ValueError(f"Job already exists: {jid}")
             job = Job(
                 job_id=jid,
                 job_type=job_type,
                 payload=payload or {},
                 priority=priority,
                 tags=tags or [],
+                max_attempts=max(1, int(max_attempts)),
             )
             self.jobs[jid] = job
+            self._persist()
             return job
 
-    def _reclaim_expired(self) -> None:
+    def _reclaim_expired(self) -> bool:
         now = time.time()
+        changed = False
         for job in self.jobs.values():
             if (
                 job.state == JobState.ASSIGNED.value
                 and job.assigned_at
                 and now - job.assigned_at > self.lease_seconds
             ):
-                job.state = JobState.QUEUED.value
+                job.state = (
+                    JobState.QUEUED.value
+                    if job.attempts < job.max_attempts
+                    else JobState.FAILED.value
+                )
                 job.assigned_client = None
                 job.assigned_at = None
+                if job.state == JobState.FAILED.value:
+                    job.error = "maximum lease attempts exceeded"
+                    job.completed_at = now
+                changed = True
+        return changed
 
     def claim_next(
         self,
@@ -97,7 +155,8 @@ class JobQueue:
         job_types: Optional[Set[str]] = None,
     ) -> Optional[Job]:
         with self._lock:
-            self._reclaim_expired()
+            if self._reclaim_expired():
+                self._persist()
             candidates = [
                 j
                 for j in self.jobs.values()
@@ -111,6 +170,8 @@ class JobQueue:
             job.state = JobState.ASSIGNED.value
             job.assigned_client = client_id
             job.assigned_at = time.time()
+            job.attempts += 1
+            self._persist()
             return job
 
     def submit_result(
@@ -125,7 +186,10 @@ class JobQueue:
             job = self.jobs.get(job_id)
             if not job:
                 return None
-            if job.assigned_client and job.assigned_client != client_id:
+            if (
+                job.state != JobState.ASSIGNED.value
+                or job.assigned_client != client_id
+            ):
                 return None
             if success:
                 job.state = JobState.COMPLETED.value
@@ -136,6 +200,21 @@ class JobQueue:
                 job.error = error or "failed"
                 job.result = result
             job.completed_at = time.time()
+            self._persist()
+            return job
+
+    def cancel(self, job_id: str) -> Optional[Job]:
+        with self._lock:
+            job = self.jobs.get(job_id)
+            if not job or job.state in {
+                JobState.COMPLETED.value,
+                JobState.CANCELLED.value,
+            }:
+                return None
+            job.state = JobState.CANCELLED.value
+            job.completed_at = time.time()
+            job.error = "cancelled by operator"
+            self._persist()
             return job
 
     def get(self, job_id: str) -> Optional[Job]:

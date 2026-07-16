@@ -1,14 +1,14 @@
 """
 Dataset Loader Module
 
-Loads local private datasets for LoRA fine-tuning via the shared datasets package.
+Loads local private datasets for LoRA fine-tuning.
 """
 
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 import os
 
-from datasets import load_local_dataset as load_private_dataset
+from private_datasets import load_local_dataset as load_private_dataset
 
 
 @dataclass
@@ -34,17 +34,14 @@ def load_local_dataset(
     path = dataset_path or os.getenv("DATASET_PATH") or None
     ds = load_private_dataset(path=path)
     texts = list(ds.texts)
-    if not texts and ds.rows:
-        texts = [str(r.get("text", r)) for r in ds.rows]
 
     if config.max_samples:
         texts = texts[: config.max_samples]
 
-    # Ensure non-empty for LoRA demos
     if not texts:
-        texts = [
-            "Federated LoRA keeps base weights fixed and shares adapters only.",
-            "Private local text never leaves the volunteer or edge node.",
-        ] * 10
+        raise ValueError(
+            "LoRA training requires text samples. Set DATASET_TEXT_COLUMN to "
+            "the text field in the configured dataset."
+        )
 
     return texts, len(texts)

@@ -79,7 +79,7 @@ class LocalLauncher:
 
     @property
     def enabled(self) -> bool:
-        return os.getenv("ENABLE_LOCAL_LAUNCHER", "true").lower() in ("1", "true", "yes")
+        return os.getenv("ENABLE_LOCAL_LAUNCHER", "false").lower() in ("1", "true", "yes")
 
     def list(self) -> List[Dict[str, Any]]:
         self._refresh()
@@ -240,7 +240,12 @@ class LocalLauncher:
             types = job_types.strip() or "inference,label,compute"
             env["JOB_TYPES"] = types
             env["WORK_MODES"] = types
+            env["COMPUTE_PLUGIN_ALLOWLIST"] = env.get(
+                "COMPUTE_PLUGIN_ALLOWLIST",
+                "examples.science_plugin",
+            )
             summary["JOB_TYPES"] = types
+            summary["COMPUTE_PLUGIN_ALLOWLIST"] = env["COMPUTE_PLUGIN_ALLOWLIST"]
             ds = self._resolve_dataset(dataset_preset, dataset_path)
             if ds:
                 env["DATASET_PATH"] = ds

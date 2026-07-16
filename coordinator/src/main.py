@@ -191,6 +191,17 @@ def _require_operator(operator_key: Optional[str]) -> None:
             detail="Operator authentication required. Set OPERATOR_API_KEY and pass operator_key.",
         )
 
+
+def _require_json_size(value: Any, *, env_name: str, default: int, label: str) -> None:
+    limit = int(os.getenv(env_name, str(default)))
+    size = len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
+    if size > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{label} is {size} bytes; maximum is {limit}",
+        )
+
+
 # Pydantic models for request/response
 class ClientRegisterRequest(BaseModel):
     """Request model for client registration."""
@@ -249,7 +260,7 @@ class LaunchRequest(BaseModel):
 
 class LaunchDemoRequest(BaseModel):
     """One-click local demo: model + clients + worker + sample job."""
-    model_id: str = "tiny_cnn"
+    model_id: str = "simple_mlp"
     dataset_preset: str = "sample_private"
     train_clients: int = 2
     start_worker: bool = True
@@ -870,6 +881,7 @@ async def dashboard_overview(limit: int = Query(25, ge=1, le=100)) -> Dict[str, 
         "reputations": reputation_manager.get_all_reputations(),
         "incentives": incentive_manager.get_all_incentives(),
         "lora_base_models": base_model_registry.list_models(),
+        "lora_adapters": adapter_store.list_models(),
         "lora_rounds": lora_round_manager.list_rounds(limit=limit),
         "registered_clients": sorted(list(round_manager.clients)),
         "jobs": job_queue.list_jobs(limit=min(limit, 25)),
@@ -904,6 +916,28 @@ async def create_round(
             status_code=400,
             detail=f"Base model {request.base_model_id} not found. Available: {base_model_registry.list_models()}"
         )
+    if request.adapter_version:
+        if not adapter_store.model_exists(request.adapter_version):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Adapter {request.adapter_version} not found",
+            )
+        previous = adapter_store.load_model(request.adapter_version)
+        if previous.get("base_model_id") != request.base_model_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Previous adapter uses a different base model",
+            )
+        previous_lora = previous.get("lora_config") or {}
+        requested_targets = request.target_modules or ["q_proj", "v_proj"]
+        if previous_lora and (
+            previous_lora.get("r") != request.lora_r
+            or previous_lora.get("target_modules") != requested_targets
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Previous adapter has incompatible rank or target modules",
+            )
     
     # Create round
     config = create_lora_round(
@@ -1002,6 +1036,12 @@ async def submit_adapter(
             status_code=401,
             detail="Authentication failed. Valid API key required."
         )
+    _require_json_size(
+        request.adapter_state_dict,
+        env_name="MAX_ADAPTER_UPLOAD_BYTES",
+        default=100_000_000,
+        label="Adapter upload",
+    )
     
     # Rate limiting
     if rate_limiter:
@@ -1067,6 +1107,20 @@ async def submit_adapter(
     )
 
 
+@app.get("/adapters/{version}")
+async def download_adapter(
+    version: str,
+    client_id: str,
+    api_key: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    """Download a prior aggregated adapter for continued LoRA training."""
+    if not auth_manager.validate_api_key(api_key, client_id):
+        raise HTTPException(status_code=401, detail="Authentication failed")
+    if not adapter_store.model_exists(version):
+        raise HTTPException(status_code=404, detail=f"Adapter {version} not found")
+    return adapter_store.load_model(version)
+
+
 @app.post("/rounds/{round_id}/aggregate", response_model=AggregateRoundResponse)
 async def aggregate_lora_round(
     round_id: int,
@@ -1105,7 +1159,8 @@ async def aggregate_lora_round(
             status_code=400,
             detail=f"No adapter submissions for round {round_id}"
         )
-    
+    lora_round_manager.set_state(round_id, "AGGREGATING")
+
     # Aggregate adapters
     aggregated_adapter = aggregate_lora_adapters(
         submissions,
@@ -1113,36 +1168,79 @@ async def aggregate_lora_round(
     )
     
     if aggregated_adapter is None:
+        lora_round_manager.set_state(round_id, "COLLECTING")
         raise HTTPException(
             status_code=500,
             detail="Failed to aggregate adapters"
         )
     
     # Generate new adapter version
-    if config.adapter_version:
-        adapter_version = next_version(config.adapter_version)
-    else:
-        adapter_version = "v1"
+    version_base = adapter_store.latest_model_version()
+    adapter_version = next_version(version_base) if version_base else "v1"
     
-    # Evaluate adapter
-    previous_loss = None  # TODO: Load from previous adapter if exists
-    eval_result = evaluate_adapter(
-        round_id=round_id,
-        adapter_version=adapter_version,
-        aggregated_adapter=aggregated_adapter,
-        previous_adapter_loss=previous_loss
-    )
+    # Evaluate adapter on a real configured holdout dataset. No proxy metric.
+    previous_loss = None
+    if config.adapter_version and adapter_store.model_exists(config.adapter_version):
+        previous_adapter = adapter_store.load_model(config.adapter_version)
+        previous_loss = (
+            previous_adapter.get("evaluation", {}).get("loss")
+        )
+    base_model = base_model_registry.get_model_config(config.base_model_id)
+    if base_model is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown base model: {config.base_model_id}",
+        )
+    try:
+        eval_result = evaluate_adapter(
+            round_id=round_id,
+            adapter_version=adapter_version,
+            aggregated_adapter=aggregated_adapter,
+            base_model_name=base_model.model_name,
+            lora_r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            target_modules=config.target_modules,
+            max_seq_length=config.max_seq_length,
+            previous_adapter_loss=previous_loss,
+        )
+    except Exception as exc:
+        lora_round_manager.set_state(round_id, "COLLECTING")
+        raise HTTPException(
+            status_code=500,
+            detail=f"LoRA evaluation failed: {exc}",
+        ) from exc
+    if (
+        eval_result.evaluated
+        and not eval_result.passed
+        and os.getenv("LORA_REJECT_REGRESSION", "false").lower()
+        in {"1", "true", "yes"}
+    ):
+        lora_round_manager.set_state(round_id, "COLLECTING")
+        raise HTTPException(
+            status_code=422,
+            detail="Aggregated adapter regressed on the holdout dataset",
+        )
     
     # Save adapter
     adapter_data = {
         "version": adapter_version,
         "round_id": round_id,
         "base_model_id": config.base_model_id,
+        "lora_config": {
+            "r": config.lora_r,
+            "alpha": config.lora_alpha,
+            "dropout": config.lora_dropout,
+            "target_modules": config.target_modules,
+        },
         "adapter_state_dict": aggregated_adapter,
         "num_clients": len(submissions),
         "evaluation": {
             "loss": eval_result.evaluation_loss,
-            "passed": eval_result.passed
+            "passed": eval_result.passed,
+            "evaluated": eval_result.evaluated,
+            "num_samples": eval_result.num_eval_samples,
+            "reason": eval_result.reason,
         },
         "created_at": time.time()
     }
@@ -1150,6 +1248,7 @@ async def aggregate_lora_round(
     try:
         adapter_store.save_model(adapter_version, adapter_data)
     except Exception as e:
+        lora_round_manager.set_state(round_id, "COLLECTING")
         logger.error(f"Failed to save adapter {adapter_version}: {e}")
         raise HTTPException(
             status_code=500,
@@ -1228,6 +1327,12 @@ async def create_job(
             status_code=400,
             detail=f"job_type must be one of {sorted(allowed)}",
         )
+    _require_json_size(
+        request.payload or {},
+        env_name="MAX_JOB_PAYLOAD_BYTES",
+        default=1_000_000,
+        label="Job payload",
+    )
     job = job_queue.create_job(
         job_type=request.job_type,
         payload=request.payload,
@@ -1284,6 +1389,12 @@ async def submit_job_result(job_id: str, request: JobResultRequest) -> Dict[str,
     """Submit results for a claimed job (private data stays on client)."""
     if not auth_manager.validate_api_key(request.api_key, request.client_id):
         raise HTTPException(status_code=401, detail="Authentication failed")
+    _require_json_size(
+        request.result,
+        env_name="MAX_JOB_RESULT_BYTES",
+        default=5_000_000,
+        label="Job result",
+    )
     job = job_queue.submit_result(
         job_id=job_id,
         client_id=request.client_id,
@@ -1293,6 +1404,19 @@ async def submit_job_result(job_id: str, request: JobResultRequest) -> Dict[str,
     )
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found or not assigned to client")
+    return job.to_dict()
+
+
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job(
+    job_id: str,
+    operator_key: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    """Cancel a queued, assigned, or failed job."""
+    _require_operator(operator_key)
+    job = job_queue.cancel(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found or already final")
     return job.to_dict()
 
 
@@ -1331,7 +1455,14 @@ async def launch_process(
         if request.enqueue_sample_job and request.kind == "worker":
             sample_job = job_queue.create_job(
                 "compute",
-                {"formula": "monte_carlo_pi", "seed": int(time.time()) % 10000, "steps": 80000},
+                {
+                    "entrypoint": "examples.science_plugin:lennard_jones",
+                    "work_unit": {
+                        "positions": [[0, 0, 0], [1.2, 0, 0], [0, 1.2, 0]],
+                        "steps": 250,
+                        "dt": 0.001,
+                    },
+                },
             ).to_dict()
         return {
             "success": True,
@@ -1386,9 +1517,12 @@ async def launch_demo(
             sample_job = job_queue.create_job(
                 "compute",
                 {
-                    "formula": "monte_carlo_pi",
-                    "seed": int(time.time()) % 10000,
-                    "steps": 100000,
+                    "entrypoint": "examples.science_plugin:lennard_jones",
+                    "work_unit": {
+                        "positions": [[0, 0, 0], [1.2, 0, 0], [0, 1.2, 0]],
+                        "steps": 250,
+                        "dt": 0.001,
+                    },
                 },
             ).to_dict()
         return {
@@ -1457,6 +1591,7 @@ async def root():
         "dashboard_overview": "GET /dashboard/overview",
         "create_lora_round": "POST /rounds/create",
         "get_lora_round": "GET /rounds/{round_id}",
+        "download_lora_adapter": "GET /adapters/{version}",
         "submit_lora_adapter": "POST /rounds/{round_id}/submit",
         "aggregate_lora_round": "POST /rounds/{round_id}/aggregate"
     }

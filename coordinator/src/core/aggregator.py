@@ -77,6 +77,27 @@ def fedavg_weight_deltas(deltas: List[List[List[float]]]) -> List[List[float]]:
     return averaged
 
 
+def apply_weight_delta(
+    base_weights: List[List[float]],
+    delta: List[List[float]],
+) -> List[List[float]]:
+    """Apply a flattened parameter delta to a global model."""
+    if len(base_weights) != len(delta):
+        raise ValueError("Base model and delta have different layer counts")
+    updated: List[List[float]] = []
+    for layer_index, (base_layer, delta_layer) in enumerate(
+        zip(base_weights, delta)
+    ):
+        if len(base_layer) != len(delta_layer):
+            raise ValueError(
+                f"Base model and delta differ at layer {layer_index}"
+            )
+        updated.append(
+            [float(base) + float(change) for base, change in zip(base_layer, delta_layer)]
+        )
+    return updated
+
+
 class Aggregator:
     """Aggregates client updates with FedAvg and optional persistence."""
 
@@ -111,6 +132,16 @@ class Aggregator:
                 continue
             restored: List[ClientUpdate] = []
             for item in items:
+                try:
+                    payload = json.loads(item["weight_delta"])
+                except (KeyError, TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict) or not payload.get("base_weights"):
+                    logger.warning(
+                        f"Dropping legacy pending update for round {round_id}; "
+                        "it has no shared base model"
+                    )
+                    continue
                 restored.append(
                     ClientUpdate(
                         client_id=item["client_id"],
@@ -123,6 +154,7 @@ class Aggregator:
                     self.round_manager.add_update(item["client_id"], round_id, item["weight_delta"])
             if restored:
                 self.updates[round_id] = restored
+        self._persist_pending()
 
     def _persist_pending(self) -> None:
         if not self.state_store:
@@ -205,6 +237,9 @@ class Aggregator:
             }
 
         parsed: List[List[List[float]]] = []
+        base_models: List[List[List[float]]] = []
+        model_ids: List[str] = []
+        model_configs: List[Dict[str, Any]] = []
         valid_clients: List[str] = []
         losses: List[float] = []
         for update in round_updates:
@@ -214,14 +249,32 @@ class Aggregator:
                     f"Skipping unparseable update from {update.client_id} in round {round_id}"
                 )
                 continue
-            parsed.append(delta)
-            valid_clients.append(update.client_id)
             try:
                 payload = json.loads(update.weight_delta)
-                if isinstance(payload, dict) and "final_loss" in payload:
-                    losses.append(float(payload["final_loss"]))
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
+                if not isinstance(payload, dict):
+                    raise ValueError("Update payload must be an object")
+                base_weights = payload.get("base_weights")
+                if (
+                    not isinstance(base_weights, list)
+                    or not base_weights
+                    or not all(isinstance(layer, list) for layer in base_weights)
+                ):
+                    raise ValueError("Update is missing base_weights")
+                apply_weight_delta(base_weights, delta)  # shape validation
+                parsed.append(delta)
+                base_models.append(base_weights)
+                model_ids.append(str(payload.get("model_id", "simple_mlp")))
+                model_configs.append(payload.get("model_config") or {})
+                valid_clients.append(update.client_id)
+                if "final_loss" in payload:
+                    try:
+                        losses.append(float(payload["final_loss"]))
+                    except (TypeError, ValueError):
+                        pass
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                logger.warning(
+                    f"Skipping invalid update from {update.client_id}: {exc}"
+                )
 
         if not parsed:
             self.round_manager.set_round_state(round_id, RoundState.CLOSED)
@@ -232,19 +285,58 @@ class Aggregator:
                 "num_updates": 0,
             }
 
+        canonical_base = json.dumps(base_models[0], separators=(",", ":"))
+        if any(
+            json.dumps(base, separators=(",", ":")) != canonical_base
+            for base in base_models[1:]
+        ):
+            logger.error("Clients did not train from identical global weights")
+            self.round_manager.set_round_state(round_id, RoundState.COLLECTING)
+            return None
+        if len(set(model_ids)) != 1:
+            logger.error("Clients submitted updates for different model architectures")
+            self.round_manager.set_round_state(round_id, RoundState.COLLECTING)
+            return None
+        canonical_config = json.dumps(
+            model_configs[0],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if any(
+            json.dumps(config, sort_keys=True, separators=(",", ":"))
+            != canonical_config
+            for config in model_configs[1:]
+        ):
+            logger.error("Clients submitted incompatible model configurations")
+            self.round_manager.set_round_state(round_id, RoundState.COLLECTING)
+            return None
+
         try:
             averaged_delta = fedavg_weight_deltas(parsed)
+            global_weights = apply_weight_delta(base_models[0], averaged_delta)
         except ValueError as e:
             logger.error(f"FedAvg failed for round {round_id}: {e}")
             self.round_manager.set_round_state(round_id, RoundState.COLLECTING)
             return None
 
         round_model_version = round_obj.model_version
-        new_model_version = next_version(round_model_version)
+        if self.model_store.model_exists(round_model_version):
+            latest_global = self.model_store.latest_model_version()
+            new_model_version = next_version(latest_global or round_model_version)
+        else:
+            # The first version for an architecture is reserved by TaskAssigner.
+            new_model_version = round_model_version
 
         aggregated_model_data = {
             "version": new_model_version,
-            "base_version": round_model_version,
+            "base_version": (
+                round_model_version
+                if self.model_store.model_exists(round_model_version)
+                else None
+            ),
+            "model_id": model_ids[0],
+            "model_config": model_configs[0],
+            "weights": global_weights,
             "round_id": round_id,
             "aggregation": "fedavg",
             "averaged_weight_delta": averaged_delta,

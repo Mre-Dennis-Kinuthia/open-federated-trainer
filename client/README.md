@@ -300,21 +300,20 @@ All API functions automatically retry on connection failures:
 
 ### `trainer.py`
 
-Local model training module. Currently simulates training for the MVP.
+Local PyTorch training module. It performs gradient descent and returns
+JSON-serialized parameter deltas for FedAvg.
 
 **Functions:**
 
 #### `train_local_model_with_client_id(task: Dict[str, Any], client_id: str) -> str`
-Simulate local model training and return a deterministic weight delta.
+Train the configured MLP and return its parameter delta.
 
 **Parameters:**
 - `task`: Task dictionary containing `round_id`, `model_version`, `task`, `description`
 - `client_id`: Identifier of the client performing training
 
 **Returns:**
-- Weight delta as a string (deterministic based on inputs)
-
-**Note:** This is a placeholder implementation. In production, replace this with actual PyTorch/TensorFlow training code.
+- JSON weight-delta payload
 
 **Example:**
 ```python
@@ -322,7 +321,8 @@ from trainer import train_local_model_with_client_id
 
 task = {"round_id": 1, "model_version": 1, "task": "train", "description": "..."}
 weight_delta = train_local_model_with_client_id(task, "my_client")
-# Returns: "delta_my_client_r1_v1_a1b2c3d4"
+# Requires DATASET_PATH through the normal client path. Synthetic direct calls
+# require the explicit ALLOW_SYNTHETIC_DATA=true demo flag.
 ```
 
 **Replacing with Real Training:**

@@ -1,12 +1,13 @@
-"""
-Evaluate LoRA Adapter
+"""Dataset-backed evaluation for an aggregated LoRA adapter."""
 
-Evaluates an aggregated LoRA adapter on a small held-out dataset.
-Compares performance against previous adapter version.
-"""
+from __future__ import annotations
 
-from typing import Dict, Optional
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 from utils.logger import get_logger
 
 logger = get_logger("evaluation")
@@ -14,122 +15,206 @@ logger = get_logger("evaluation")
 
 @dataclass
 class AdapterEvaluationResult:
-    """Result of adapter evaluation."""
     round_id: int
     adapter_version: str
-    evaluation_loss: float
+    evaluation_loss: Optional[float]
     num_eval_samples: int
-    passed: bool  # True if loss improved or stayed same
+    passed: bool
+    evaluated: bool
     previous_loss: Optional[float] = None
-    improvement: Optional[float] = None  # Negative if improved
+    improvement: Optional[float] = None
+    reason: Optional[str] = None
+
+
+def _load_eval_texts(path: Path, text_column: str) -> List[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"LoRA evaluation dataset not found: {path}")
+    if path.is_dir():
+        texts = [
+            item.read_text(encoding="utf-8")
+            for item in sorted(path.rglob("*.txt"))
+        ]
+    elif path.suffix.lower() == ".jsonl":
+        texts = []
+        with path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict) or text_column not in row:
+                    raise ValueError(
+                        f"JSONL evaluation row {line_number} lacks {text_column!r}"
+                    )
+                texts.append(str(row[text_column]))
+    elif path.suffix.lower() == ".json":
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, dict) and "data" in value:
+            value = value["data"]
+        if not isinstance(value, list):
+            raise ValueError("Evaluation JSON must be a list or {'data': [...]}")
+        texts = [
+            str(row[text_column])
+            for row in value
+            if isinstance(row, dict) and text_column in row
+        ]
+    else:
+        texts = [
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    max_samples = max(1, int(os.getenv("LORA_EVAL_MAX_SAMPLES", "64")))
+    texts = texts[:max_samples]
+    if not texts:
+        raise ValueError("LoRA evaluation dataset contains no text samples")
+    return texts
 
 
 def evaluate_adapter(
     round_id: int,
     adapter_version: str,
-    aggregated_adapter: Dict,
-    previous_adapter_loss: Optional[float] = None
+    aggregated_adapter: Dict[str, Any],
+    *,
+    base_model_name: str,
+    lora_r: int,
+    lora_alpha: int,
+    lora_dropout: float,
+    target_modules: List[str],
+    max_seq_length: int,
+    previous_adapter_loss: Optional[float] = None,
+    dataset_path: Optional[str] = None,
 ) -> AdapterEvaluationResult:
+    """Load the base model + aggregate and calculate causal-LM holdout loss.
+
+    If no evaluation dataset is configured, evaluation is explicitly skipped;
+    no parameter-norm proxy or fabricated loss is returned.
     """
-    Evaluate an aggregated LoRA adapter.
-    
-    This is a minimal evaluation hook. In production, this would:
-    1. Load base model + aggregated adapter
-    2. Run on held-out evaluation dataset
-    3. Compute loss/metrics
-    4. Compare with previous adapter
-    
-    For MVP, we use a simplified check:
-    - Validate adapter structure
-    - Check for reasonable parameter norms
-    - Compare with previous loss if available
-    
-    Args:
-        round_id: Round identifier
-        adapter_version: Version string for the adapter
-        aggregated_adapter: Aggregated adapter state dict
-        previous_adapter_loss: Loss from previous adapter version (optional)
-        
-    Returns:
-        AdapterEvaluationResult with evaluation metrics
-    """
-    logger.info(f"Evaluating adapter {adapter_version} for round {round_id}", extra={
-        "component": "evaluation",
-        "event": "evaluation_started",
-        "round_id": round_id,
-        "adapter_version": adapter_version
-    })
-    
-    # Minimal validation: check adapter structure
-    if not aggregated_adapter or len(aggregated_adapter) == 0:
-        logger.error("Empty adapter for evaluation")
+    configured_path = (
+        dataset_path or os.getenv("LORA_EVAL_DATASET_PATH", "")
+    ).strip()
+    if not configured_path:
+        reason = "LORA_EVAL_DATASET_PATH is not configured"
+        if os.getenv("LORA_REQUIRE_EVALUATION", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            raise ValueError(reason)
         return AdapterEvaluationResult(
             round_id=round_id,
             adapter_version=adapter_version,
-            evaluation_loss=float('inf'),
+            evaluation_loss=None,
             num_eval_samples=0,
-            passed=False
+            passed=False,
+            evaluated=False,
+            previous_loss=previous_adapter_loss,
+            reason=reason,
         )
-    
-    # Compute average parameter norm as a proxy for "quality"
-    # In production, this would be actual evaluation loss
-    import numpy as np
-    
-    total_norm = 0.0
-    num_params = 0
-    
-    for key, value in aggregated_adapter.items():
-        if isinstance(value, list):
-            arr = np.array(value)
-            norm = np.linalg.norm(arr)
-            total_norm += norm
-            num_params += 1
-    
-    avg_norm = total_norm / num_params if num_params > 0 else float('inf')
-    
-    # Use norm as proxy for loss (lower is better, but this is just a placeholder)
-    # In real implementation, this would be actual evaluation loss
-    evaluation_loss = avg_norm
-    
-    # Compare with previous adapter
-    passed = True
-    improvement = None
-    
-    if previous_adapter_loss is not None:
-        improvement = evaluation_loss - previous_adapter_loss
-        # Pass if loss improved (decreased) or stayed same (within tolerance)
-        if improvement > 0.1:  # Loss increased significantly
-            passed = False
-            logger.warning(f"Adapter evaluation failed: loss increased by {improvement:.4f}", extra={
-                "component": "evaluation",
-                "event": "evaluation_failed",
-                "round_id": round_id,
-                "improvement": improvement
-            })
-        else:
-            logger.info(f"Adapter evaluation passed: improvement={improvement:.4f}", extra={
-                "component": "evaluation",
-                "event": "evaluation_passed",
-                "round_id": round_id,
-                "improvement": improvement
-            })
-    else:
-        # First adapter, no comparison
-        logger.info(f"First adapter evaluation (no previous to compare)", extra={
+    if not aggregated_adapter:
+        raise ValueError("Cannot evaluate an empty adapter")
+
+    try:
+        import torch
+        from peft import (
+            LoraConfig,
+            TaskType,
+            get_peft_model,
+            set_peft_model_state_dict,
+        )
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as exc:
+        raise ImportError(
+            "Real LoRA evaluation requires torch, transformers, and peft"
+        ) from exc
+
+    texts = _load_eval_texts(
+        Path(configured_path).expanduser().resolve(),
+        os.getenv("LORA_EVAL_TEXT_COLUMN", "text"),
+    )
+    device_name = os.getenv(
+        "LORA_EVAL_DEVICE",
+        "cuda" if torch.cuda.is_available() else "cpu",
+    )
+    device = torch.device(device_name)
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+
+    logger.info(
+        f"Evaluating adapter {adapter_version} on {len(texts)} samples",
+        extra={
             "component": "evaluation",
-            "event": "evaluation_passed",
-            "round_id": round_id
-        })
-    
-    result = AdapterEvaluationResult(
+            "event": "evaluation_started",
+            "round_id": round_id,
+            "base_model": base_model_name,
+        },
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_name,
+        trust_remote_code=False,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_name,
+        trust_remote_code=False,
+        torch_dtype=dtype,
+    )
+    peft_model = get_peft_model(
+        model,
+        LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        ),
+    )
+    state = {
+        key: torch.tensor(value)
+        for key, value in aggregated_adapter.items()
+    }
+    load_result = set_peft_model_state_dict(peft_model, state)
+    unexpected = getattr(load_result, "unexpected_keys", [])
+    if unexpected:
+        raise ValueError(f"Aggregated adapter has unexpected keys: {unexpected[:5]}")
+    peft_model.to(device)
+    peft_model.eval()
+
+    batch_size = max(1, int(os.getenv("LORA_EVAL_BATCH_SIZE", "2")))
+    weighted_loss = 0.0
+    evaluated = 0
+    with torch.no_grad():
+        for offset in range(0, len(texts), batch_size):
+            batch = texts[offset : offset + batch_size]
+            tokens = tokenizer(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_seq_length,
+            )
+            tokens = {key: value.to(device) for key, value in tokens.items()}
+            labels = tokens["input_ids"].clone()
+            labels[tokens["attention_mask"] == 0] = -100
+            output = peft_model(**tokens, labels=labels)
+            weighted_loss += float(output.loss.item()) * len(batch)
+            evaluated += len(batch)
+
+    loss = weighted_loss / evaluated
+    improvement = (
+        loss - previous_adapter_loss
+        if previous_adapter_loss is not None
+        else None
+    )
+    tolerance = float(os.getenv("LORA_EVAL_REGRESSION_TOLERANCE", "0.1"))
+    passed = improvement is None or improvement <= tolerance
+    return AdapterEvaluationResult(
         round_id=round_id,
         adapter_version=adapter_version,
-        evaluation_loss=evaluation_loss,
-        num_eval_samples=0,  # Placeholder
+        evaluation_loss=loss,
+        num_eval_samples=evaluated,
         passed=passed,
+        evaluated=True,
         previous_loss=previous_adapter_loss,
-        improvement=improvement
+        improvement=improvement,
     )
-    
-    return result
-

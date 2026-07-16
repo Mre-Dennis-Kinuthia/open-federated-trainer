@@ -7,7 +7,7 @@ This document tracks what was hardened toward production use and what remains.
 1. **Durable auth** — API keys + client registry in `coordinator/data/state.json`
 2. **Idempotent registration** — returning clients get the same key (no hard fail)
 3. **Client key persistence** — `client/data/api_key` (or `CLIENT_API_KEY` / `CLIENT_API_KEY_FILE`)
-4. **Real classic FedAvg** — parses JSON weight deltas and averages parameter layers
+4. **Real classic FedAvg** — clients load the shared global model, train from identical base weights, and the coordinator applies averaged deltas to produce the next global model
 5. **Pending update checkpoint** — in-flight updates survive coordinator restart
 6. **Async auto-aggregation** — `ENABLE_ASYNC_ROUNDS=true` by default; aggregates when min updates or timeout hit
 7. **Operator auth** — set `OPERATOR_API_KEY` to lock create/aggregate endpoints
@@ -16,7 +16,13 @@ This document tracks what was hardened toward production use and what remains.
 10. **LoRA client** — fixed `get_base_model_name`; persists API key
 11. **Pluggable models** — `simple_mlp` / `tiny_cnn` / `MODEL_MODULE` custom trainers (see EXTENSIBILITY.md)
 12. **Private datasets** — CSV / JSONL / JSON / folder / HuggingFace via `DATASET_PATH` (data stays on client)
-13. **Non-training jobs** — inference / label / compute queue + `worker.py`
+13. **Non-training jobs** — real Transformers inference/labeling + allowlisted compute plugins
+14. **Durable job queue** — jobs, leases, attempts, and results survive coordinator restart
+15. **Real LoRA evaluation** — optional base-model holdout loss; no proxy metric
+16. **LoRA continuation** — authenticated clients download prior aggregated adapters
+17. **Durable LoRA rounds** — round configuration, lifecycle, and adapter submissions survive coordinator restarts
+18. **Reliable LoRA uploads** — transient failures use bounded exponential retries; upload size is capped by `MAX_ADAPTER_UPLOAD_BYTES`
+19. **Safer local launcher** — disabled by default outside `coordinator/run.sh`
 
 ## Still required for full production fleet
 
@@ -26,11 +32,11 @@ This document tracks what was hardened toward production use and what remains.
 | Auth | Invite-gated registration; rotate keys; no keys in query strings long-term |
 | Privacy | Optional DP noise accounting; secure aggregation |
 | Scheduling | Reputation-weighted client selection / FedAvg weights |
-| LoRA | Download prior adapters; real eval loss; upload retries |
+| LoRA | Asynchronous evaluation and resumable/chunked adapter uploads for very large adapters |
 | Observability | Prometheus metrics; structured log shipping |
 | Scale | Multi-coordinator / Redis-backed state for HA |
 | Data | Optional DP; richer feature extractors (beyond CSV/JSONL/HF loaders) |
-| Jobs | Persist job queue across coordinator restarts (currently in-memory) |
+| Jobs | Redis/Postgres queue backend for multi-coordinator HA and sandboxed plugin containers |
 
 ## Recommended operator env
 

@@ -59,6 +59,7 @@ export type Overview = {
   reputations: Record<string, Reputation>;
   incentives: Record<string, Incentive>;
   lora_base_models: string[];
+  lora_adapters?: string[];
   lora_rounds: LoraRound[];
   registered_clients: string[];
   jobs?: Array<{
@@ -94,6 +95,7 @@ export type Overview = {
 
 export type CreateLoraPayload = {
   base_model_id: string;
+  adapter_version?: string;
   lora_r: number;
   lora_alpha: number;
   max_steps: number;
@@ -166,7 +168,10 @@ export function setActiveModel(
 ): Promise<unknown> {
   return request(`/models/active${operatorQuery()}`, {
     method: "POST",
-    body: JSON.stringify({ model_id: modelId, model_config: modelConfig ?? {} }),
+    body: JSON.stringify({
+      model_id: modelId,
+      ...(modelConfig ? { model_config: modelConfig } : {}),
+    }),
   });
 }
 

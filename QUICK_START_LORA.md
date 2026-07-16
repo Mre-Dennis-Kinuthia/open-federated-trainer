@@ -229,7 +229,7 @@ export CLIENT_API_KEY="<paste_CLIENT2_API_KEY_here>"
 1. **Client fetches round configuration** from coordinator
 2. **Downloads base model** from HuggingFace (first time only, ~5-10 min)
 3. **Initializes LoRA adapters** (fresh or from previous round)
-4. **Loads local dataset** (synthetic data for MVP)
+4. **Loads your local dataset** (`DATASET_PATH` is required)
 5. **Trains adapter** for specified number of steps
 6. **Submits adapter weights** to coordinator
 

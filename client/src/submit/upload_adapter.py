@@ -7,6 +7,7 @@ Submits LoRA adapters to the coordinator.
 import requests
 import hashlib
 import json
+import time
 from typing import Dict, Optional
 from config import config
 from security import get_api_key
@@ -58,41 +59,52 @@ def upload_adapter(
         "api_key": api_key
     }
     
-    try:
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=60.0
-        )
-        response.raise_for_status()
-        
-        result = response.json()
-        success = result.get("success", False)
-        
-        if success:
-            logger.info(f"Adapter uploaded successfully for round {round_id}", extra={
+    last_error: Optional[requests.exceptions.RequestException] = None
+    for attempt in range(config.MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                timeout=max(config.REQUEST_TIMEOUT, 60.0),
+            )
+            if response.status_code < 500:
+                response.raise_for_status()
+            elif attempt < config.MAX_RETRIES:
+                raise requests.exceptions.HTTPError(
+                    f"Coordinator returned {response.status_code}",
+                    response=response,
+                )
+            else:
+                response.raise_for_status()
+
+            success = response.json().get("success", False)
+            if success:
+                logger.info(f"Adapter uploaded successfully for round {round_id}", extra={
+                    "component": "client",
+                    "event": "adapter_uploaded",
+                    "round_id": round_id,
+                    "adapter_hash": adapter_hash
+                })
+            return success
+        except requests.exceptions.RequestException as exc:
+            last_error = exc
+            if (
+                getattr(exc, "response", None) is not None
+                and exc.response.status_code < 500
+            ):
+                raise
+            if attempt < config.MAX_RETRIES:
+                time.sleep(config.RETRY_DELAY * (2**attempt))
+                continue
+            logger.error(f"Failed to upload adapter: {exc}", extra={
                 "component": "client",
-                "event": "adapter_uploaded",
+                "event": "adapter_upload_error",
                 "round_id": round_id,
-                "adapter_hash": adapter_hash
+                "error": str(exc)
             })
-        else:
-            logger.warning(f"Adapter upload returned success=False", extra={
-                "component": "client",
-                "event": "adapter_upload_failed",
-                "round_id": round_id
-            })
-        
-        return success
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to upload adapter: {e}", extra={
-            "component": "client",
-            "event": "adapter_upload_error",
-            "round_id": round_id,
-            "error": str(e)
-        })
-        raise
+    if last_error:
+        raise last_error
+    return False
 
 
 def submit_lora_adapter(

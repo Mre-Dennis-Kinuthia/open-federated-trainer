@@ -181,7 +181,7 @@ curl -X POST http://localhost:8000/rounds/$ROUND_ID/aggregate \
 
 - Download previous adapters for incremental training
 - Support for more model architectures
-- Real dataset loading (currently synthetic)
+- Real dataset loading through `DATASET_PATH` (CSV/JSONL/JSON/folder/Hugging Face)
 - Full evaluation on held-out data
 - Secure aggregation with differential privacy
 

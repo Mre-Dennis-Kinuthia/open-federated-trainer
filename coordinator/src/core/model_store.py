@@ -104,7 +104,12 @@ class ModelStore:
         except Exception as e:
             raise IOError(f"Failed to load model {version}: {e}")
     
-    def latest_model_version(self) -> Optional[str]:
+    def latest_model_version(
+        self,
+        model_id: Optional[str] = None,
+        model_config: Optional[Dict] = None,
+        require_weights: bool = False,
+    ) -> Optional[str]:
         """
         Get the latest model version available on disk.
         
@@ -120,24 +125,37 @@ class ModelStore:
         if not model_files:
             return None
         
-        # Extract version numbers and find maximum
-        versions = []
+        candidates = []
         for model_file in model_files:
-            # Extract version from filename: model_v1.json -> v1
-            filename = model_file.stem  # "model_v1"
-            version_str = filename.replace("model_", "")
-            
-            # Validate version format
+            version_str = model_file.stem.replace("model_", "")
             if version_str.startswith("v") and version_str[1:].isdigit():
-                versions.append(version_str)
-        
-        if not versions:
+                candidates.append((int(version_str[1:]), version_str, model_file))
+
+        if not candidates:
             return None
-        
-        # Sort by version number
-        versions.sort(key=lambda v: int(v[1:]))
-        
-        return versions[-1]
+        candidates.sort(reverse=True)
+
+        if model_id is None and model_config is None and not require_weights:
+            return candidates[0][1]
+
+        for _, version_str, model_file in candidates:
+            try:
+                if require_weights:
+                    with model_file.open("r", encoding="utf-8") as handle:
+                        prefix = handle.read(65_536)
+                    if '"weights"' not in prefix:
+                        continue
+                data = json.loads(model_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if model_id is not None and data.get("model_id", "simple_mlp") != model_id:
+                continue
+            if model_config is not None and data.get("model_config", {}) != model_config:
+                continue
+            if require_weights and not data.get("weights"):
+                continue
+            return version_str
+        return None
     
     def model_exists(self, version: str) -> bool:
         """

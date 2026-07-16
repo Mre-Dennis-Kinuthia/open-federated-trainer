@@ -7,6 +7,7 @@ descent and returns weight deltas compatible with federated learning.
 """
 
 import json
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -68,16 +69,15 @@ class SimpleMLP(nn.Module):
         return x
 
 
-def _generate_fake_data(
+def _generate_synthetic_data(
     num_samples: int,
     input_dim: int,
     seed: Optional[int] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Generate fake training data for local training.
+    Generate explicit opt-in synthetic training data for tests and demos.
     
-    Creates random input-output pairs for demonstration purposes.
-    In production, this would load real local data.
+    Production client paths supply ``data`` and never call this function.
     
     Args:
         num_samples: Number of training samples to generate
@@ -118,6 +118,31 @@ def _model_parameters_to_list(model: nn.Module) -> List[List[float]]:
     return params
 
 
+def _load_model_parameters(
+    model: nn.Module,
+    values: List[List[float]],
+) -> None:
+    """Load flattened parameter arrays into a model with strict shape checks."""
+    parameters = list(model.parameters())
+    if len(values) != len(parameters):
+        raise ValueError(
+            f"Global model has {len(values)} layers; expected {len(parameters)}"
+        )
+    with torch.no_grad():
+        for index, (parameter, flat_values) in enumerate(zip(parameters, values)):
+            tensor = torch.tensor(
+                flat_values,
+                dtype=parameter.dtype,
+                device=parameter.device,
+            )
+            if tensor.numel() != parameter.numel():
+                raise ValueError(
+                    f"Global model layer {index} has {tensor.numel()} values; "
+                    f"expected {parameter.numel()}"
+                )
+            parameter.copy_(tensor.reshape(parameter.shape))
+
+
 def _compute_weight_delta(
     initial_model: nn.Module,
     trained_model: nn.Module
@@ -151,12 +176,13 @@ def train_local_model(
     output_dim: int = 1,
     seed: Optional[int] = None,
     data: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    global_weights: Optional[List[List[float]]] = None,
 ) -> str:
     """
     Perform local PyTorch-based model training and return weight delta.
 
     Uses ``data=(X, y)`` when provided (private local dataset); otherwise
-    falls back to synthetic features for demos.
+    Synthetic features are available only when ALLOW_SYNTHETIC_DATA=true.
     """
     round_id = task.get("round_id", 0)
     model_version = task.get("model_version", "v1")
@@ -183,14 +209,27 @@ def train_local_model(
             y_train = y_train.unsqueeze(1)
         output_dim = int(y_train.size(1)) if y_train.dim() == 2 else output_dim
     else:
-        X_train, y_train = _generate_fake_data(num_samples, input_dim, seed)
+        if os.getenv("ALLOW_SYNTHETIC_DATA", "false").lower() not in {
+            "1",
+            "true",
+            "yes",
+        }:
+            raise ValueError(
+                "Real training data is required; set DATASET_PATH. "
+                "ALLOW_SYNTHETIC_DATA=true is reserved for explicit demos."
+            )
+        X_train, y_train = _generate_synthetic_data(num_samples, input_dim, seed)
     
-    # Create model
+    # Every client starts from the same deterministic base or downloaded global.
+    torch.manual_seed(int(task.get("model_seed", 0)))
     model = SimpleMLP(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim)
+    if global_weights is not None:
+        _load_model_parameters(model, global_weights)
     
     # Save initial model state for delta computation
     initial_model = SimpleMLP(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim)
     initial_model.load_state_dict(model.state_dict())
+    base_weights = _model_parameters_to_list(initial_model)
     
     # Setup loss function and optimizer
     criterion = nn.MSELoss()
@@ -215,6 +254,8 @@ def train_local_model(
         "client_id": client_id or "unknown",
         "round_id": round_id,
         "model_version": model_version,
+        "model_id": task.get("model_id", "simple_mlp"),
+        "base_weights": base_weights,
         "weight_delta": weight_delta,
         "model_config": {
             "input_dim": input_dim,
