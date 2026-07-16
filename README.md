@@ -185,7 +185,31 @@ pip install -r requirements.txt
 
 ## Quick Start
 
-### Using Docker Compose (Easiest)
+### Option 1: Federated LoRA Fine-Tuning (New!)
+
+For federated LoRA fine-tuning of LLMs, see **[QUICK_START_LORA.md](./QUICK_START_LORA.md)** for detailed instructions.
+
+**Quick Commands:**
+```bash
+# Terminal 1: Start coordinator
+cd coordinator && ./run.sh
+
+# Terminal 2: Create round
+curl -X POST http://localhost:8000/rounds/create \
+  -H "Content-Type: application/json" \
+  -d '{"base_model_id": "tiny-llama", "max_steps": 50}'
+
+# Terminal 3 & 4: Run clients
+cd client && ./run_lora.sh <round_id> client-1
+cd client && ./run_lora.sh <round_id> client-2
+
+# Terminal 2: Aggregate
+curl -X POST http://localhost:8000/rounds/<round_id>/aggregate \
+  -H "Content-Type: application/json" \
+  -d '{"round_id": <round_id>}'
+```
+
+### Option 2: Using Docker Compose (Original System)
 
 ```bash
 # Clone the repository
@@ -203,9 +227,8 @@ docker compose up --scale client=5
 
 **Terminal 1 - Coordinator:**
 ```bash
-cd coordinator/src
-python main.py
-# Coordinator runs on http://localhost:8000
+cd coordinator && ./run.sh
+# Async auto-aggregation enabled by default; see PRODUCTION.md
 ```
 
 **Terminal 2 - Client:**
@@ -215,22 +238,38 @@ export COORDINATOR_URL=http://localhost:8000
 python client.py
 ```
 
+**Terminal 3 - Ops UI:**
+```bash
+cd ui && ./run.sh
+# Dashboard at http://127.0.0.1:5173
+```
+
+The UI polls `GET /dashboard/overview` every 3s and can aggregate classic rounds or create/aggregate LoRA rounds. After `cd ui && npm run build`, the coordinator also serves the app at http://localhost:8000/ui/.
+
+For volunteer/edge production hardening (durable auth, FedAvg, auto-aggregate, operator keys), see **[PRODUCTION.md](./PRODUCTION.md)**.
+
 ### Verify It's Working
 
-1. **Check Coordinator Health:**
+1. **Health:**
    ```bash
-   curl http://localhost:8000/
+   curl http://localhost:8000/health
    ```
 
-2. **View API Documentation:**
+2. **Ops UI:**
+   Open http://127.0.0.1:5173 (dev) or http://localhost:8000/ui/ (production build)
+
+3. **View API Documentation:**
    Open http://localhost:8000/docs in your browser
 
-3. **Monitor Logs:**
+4. **Monitor Logs:**
    ```bash
    docker compose logs -f
    ```
 
-For detailed quick start instructions, see [QUICK_START.md](./QUICK_START.md).
+For detailed quick start instructions:
+- **LoRA Fine-Tuning:** See [QUICK_START_LORA.md](./QUICK_START_LORA.md)
+- **Original System:** See [QUICK_START.md](./QUICK_START.md)
+- **Production path:** See [PRODUCTION.md](./PRODUCTION.md)
 
 ## API Documentation
 
@@ -469,6 +508,11 @@ open-federated-trainer/
 │   │       └── logger.py
 │   ├── Dockerfile
 │   └── requirements.txt
+│
+├── ui/                      # Ops dashboard (Vite + React)
+│   ├── src/
+│   ├── run.sh
+│   └── package.json
 │
 ├── tests/                   # Integration tests
 │   ├── integration/

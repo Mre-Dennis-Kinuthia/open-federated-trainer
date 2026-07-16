@@ -216,3 +216,30 @@ def get_round_status(round_id: int) -> Dict[str, Any]:
     response = _make_request("GET", url)
     return response.json()
 
+
+def get_lora_round(round_id: int, api_key: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Get LoRA round configuration.
+    
+    Args:
+        round_id: Identifier of the round
+        api_key: Optional API key (uses security.get_api_key() if not provided)
+        
+    Returns:
+        LoRA round configuration dictionary
+        
+    Raises:
+        CoordinatorAPIError: If round fetch fails
+        CoordinatorConnectionError: If connection fails
+    """
+    if api_key is None:
+        api_key = get_api_key()
+    
+    url = f"{config.COORDINATOR_URL}/rounds/{round_id}"
+    params = {}
+    if api_key:
+        params["api_key"] = api_key
+    
+    response = _make_request("GET", url, params=params)
+    return response.json()
+

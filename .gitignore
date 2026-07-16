@@ -29,6 +29,12 @@ Thumbs.db
 .env
 .env.local
 
+# Durable runtime state / secrets
+coordinator/data/
+client/data/
+adapters/
+*.api_key
+
 # Docker
 *.pid
 

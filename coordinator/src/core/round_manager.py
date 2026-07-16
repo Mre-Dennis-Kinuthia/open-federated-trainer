@@ -38,12 +38,16 @@ class RoundManager:
     Tracks registered clients, rounds, and their states.
     """
     
-    def __init__(self):
+    def __init__(self, state_store=None):
         """Initialize the round manager."""
+        self.state_store = state_store
         self.clients: Set[str] = set()
         self.rounds: Dict[int, Round] = {}
         self.client_round_assignments: Dict[str, int] = {}
         self.next_round_id: int = 1
+        if state_store:
+            self.clients = set(state_store.get_clients())
+            self.next_round_id = max(1, state_store.get_next_round_id())
     
     def register_client(self, client_name: str) -> bool:
         """
@@ -53,7 +57,7 @@ class RoundManager:
             client_name: Unique identifier for the client
             
         Returns:
-            True if client was registered, False if already exists
+            True if client was newly registered, False if already exists
         """
         if client_name in self.clients:
             logger.warning(f"Client {client_name} already registered", extra={
@@ -63,6 +67,9 @@ class RoundManager:
             })
             return False
         self.clients.add(client_name)
+        if self.state_store:
+            # Auth store also tracks clients; keep next_round_id durable
+            self.state_store.set_next_round_id(self.next_round_id)
         logger.info(f"Client {client_name} registered", extra={
             "component": "coordinator",
             "event": "client_registered",
@@ -127,6 +134,8 @@ class RoundManager:
                 "model_version": model_version
             })
             self.next_round_id += 1
+            if self.state_store:
+                self.state_store.set_next_round_id(self.next_round_id)
         
         active_round.assigned_clients.add(client_id)
         self.client_round_assignments[client_id] = active_round.round_id

@@ -1,0 +1,14 @@
+{
+  "round_id": 60,
+  "model_version": "v48",
+  "round_start_time": 1784208729.8872836,
+  "round_end_time": 1784209030.4832065,
+  "clients_assigned": 1,
+  "updates_received": 1,
+  "updates_accepted": 1,
+  "updates_rejected": 0,
+  "aggregation_start_time": 1784209030.4706168,
+  "aggregation_end_time": 1784209030.483205,
+  "round_duration_seconds": 300.59592294692993,
+  "aggregation_time_seconds": 0.012588262557983398
+}

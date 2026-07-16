@@ -11,9 +11,7 @@ COPY src/ ./src/
 
 # Set Python path so imports work correctly
 ENV PYTHONPATH=/app/src
-
-# CLIENT_NAME will be auto-generated from hostname if not provided
-# This ensures each client container has a unique identifier based on container name
+ENV CLIENT_API_KEY_FILE=/app/data/api_key
 
 # Run the client
 CMD ["python", "src/client.py"]

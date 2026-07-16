@@ -101,7 +101,7 @@ Our platform must:
 - Production-ready deployment (Docker, API-first design)
 - Real PyTorch training (not just simulation)
 - Comprehensive security and monitoring
-- Reputation and incentive systems
+- Reputation and incentive systems 
 
 ### 3.2 Volunteer Computing
 

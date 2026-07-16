@@ -1,108 +1,86 @@
 """
 Security Module for Client
 
-Handles API key management and security-related client operations.
+Handles API key management and persistence for volunteer/edge reconnect.
 """
 
+from __future__ import annotations
+
 import os
+from pathlib import Path
 from typing import Optional
 
 
+def _default_key_path() -> Path:
+    override = os.getenv("CLIENT_API_KEY_FILE", "").strip()
+    if override:
+        return Path(override)
+    # Persist under client/data next to src/
+    client_root = Path(__file__).resolve().parent.parent
+    return client_root / "data" / "api_key"
+
+
 class ClientSecurity:
-    """
-    Manages client-side security operations.
-    
-    Handles API key retrieval and validation.
-    """
-    
+    """Manages client-side API key load/save."""
+
     def __init__(self):
-        """Initialize the client security manager."""
+        self.key_path = _default_key_path()
         self.api_key: Optional[str] = self._load_api_key()
-    
+
     def _load_api_key(self) -> Optional[str]:
-        """
-        Load API key from environment variable.
-        
-        Returns:
-            API key string if found, None otherwise
-        """
-        api_key = os.getenv("CLIENT_API_KEY")
-        if api_key:
-            # Strip whitespace
-            api_key = api_key.strip()
-            if api_key:
-                return api_key
+        env_key = os.getenv("CLIENT_API_KEY", "").strip()
+        if env_key:
+            return env_key
+        try:
+            if self.key_path.exists():
+                key = self.key_path.read_text(encoding="utf-8").strip()
+                return key or None
+        except OSError:
+            return None
         return None
-    
+
+    def save_api_key(self, api_key: str) -> None:
+        """Persist API key to disk for reconnect after restart."""
+        self.api_key = api_key.strip()
+        try:
+            self.key_path.parent.mkdir(parents=True, exist_ok=True)
+            self.key_path.write_text(self.api_key + "\n", encoding="utf-8")
+            try:
+                os.chmod(self.key_path, 0o600)
+            except OSError:
+                pass
+        except OSError as e:
+            print(f"[Security] Warning: could not persist API key: {e}")
+
     def get_api_key(self) -> Optional[str]:
-        """
-        Get the client's API key.
-        
-        Returns:
-            API key string if available, None otherwise
-        """
         return self.api_key
-    
+
     def has_api_key(self) -> bool:
-        """
-        Check if client has an API key.
-        
-        Returns:
-            True if API key is available, False otherwise
-        """
         return self.api_key is not None
-    
+
     def require_api_key(self) -> str:
-        """
-        Get API key, raising an error if not available.
-        
-        Returns:
-            API key string
-            
-        Raises:
-            ValueError: If API key is not set
-        """
         if not self.api_key:
             raise ValueError(
-                "CLIENT_API_KEY environment variable is required. "
-                "Please set it before running the client."
+                "CLIENT_API_KEY not set and no key file found. "
+                "Register once or set CLIENT_API_KEY / CLIENT_API_KEY_FILE."
             )
         return self.api_key
 
 
-# Global security instance
 _security = ClientSecurity()
 
 
 def get_api_key() -> Optional[str]:
-    """
-    Get the client's API key.
-    
-    Returns:
-        API key string if available, None otherwise
-    """
     return _security.get_api_key()
 
 
 def require_api_key() -> str:
-    """
-    Get API key, raising an error if not available.
-    
-    Returns:
-        API key string
-        
-    Raises:
-        ValueError: If API key is not set
-    """
     return _security.require_api_key()
 
 
 def has_api_key() -> bool:
-    """
-    Check if client has an API key.
-    
-    Returns:
-        True if API key is available, False otherwise
-    """
     return _security.has_api_key()
 
+
+def save_api_key(api_key: str) -> None:
+    _security.save_api_key(api_key)

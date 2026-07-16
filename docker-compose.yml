@@ -1,3 +1,5 @@
+version: "3.8"
+
 services:
   coordinator:
     build:
@@ -7,16 +9,25 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Persist models directory across restarts
       - ./coordinator/models:/app/models
+      - ./coordinator/metrics:/app/metrics
+      - ./coordinator/logs:/app/logs
+      - ./coordinator/data:/app/data
+      - ./adapters:/app/adapters
     environment:
       - PYTHONUNBUFFERED=1
+      - ENABLE_ASYNC_ROUNDS=true
+      - ASYNC_MIN_UPDATES=2
+      - ASYNC_MAX_DURATION=300
+      - OPERATOR_API_KEY=${OPERATOR_API_KEY:-}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import http.client; conn = http.client.HTTPConnection('localhost', 8000); conn.request('GET', '/'); r = conn.getresponse(); exit(0 if r.status == 200 else 1)"]
+      test: ["CMD", "python", "-c", "import http.client; conn = http.client.HTTPConnection('localhost', 8000); conn.request('GET', '/health'); r = conn.getresponse(); exit(0 if r.status == 200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 15s
     networks:
       - federated-network
 
@@ -24,25 +35,27 @@ services:
     build:
       context: ./client
       dockerfile: Dockerfile
-    # Don't set container_name to allow scaling
     environment:
       - COORDINATOR_URL=http://coordinator:8000
       - CLIENT_NAME=${CLIENT_NAME:-}
+      - CLIENT_API_KEY=${CLIENT_API_KEY:-}
       - MAX_RETRIES=3
       - SLEEP_BETWEEN_ROUNDS=5.0
       - RETRY_DELAY=2.0
       - PYTHONUNBUFFERED=1
-      # Docker Compose provides HOSTNAME which will be unique per container
       - HOSTNAME
+    volumes:
+      - client-keys:/app/data
     depends_on:
       coordinator:
         condition: service_healthy
     networks:
       - federated-network
-    # Allow clients to exit and restart (simulating unreliable nodes)
     restart: unless-stopped
 
 networks:
   federated-network:
     driver: bridge
 
+volumes:
+  client-keys:

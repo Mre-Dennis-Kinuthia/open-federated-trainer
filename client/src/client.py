@@ -33,7 +33,7 @@ from behavior import (
     simulate_coordinator_delay,
     apply_training_delay
 )
-from security import get_api_key, require_api_key, has_api_key
+from security import get_api_key, require_api_key, has_api_key, save_api_key
 
 logger = setup_client_logger()
 
@@ -136,6 +136,7 @@ def run_client_loop(client_id: str, api_key: Optional[str] = None) -> None:
                         new_client_id, new_api_key = register_client(client_id)
                         print(f"[Client {client_id}] Re-registered successfully as '{new_client_id}'")
                         print(f"[Client {client_id}] New API Key: {new_api_key}")
+                        save_api_key(new_api_key)
                         client_id = new_client_id  # Update client_id in case it changed
                         api_key = new_api_key  # Update API key
                         continue  # Retry fetching task
@@ -240,35 +241,26 @@ def main() -> None:
     client_name = generate_client_name()
     print(f"Client Name: {client_name}")
     
-    # Step 1: Register with coordinator
+    # Step 1: Register with coordinator (idempotent; persists key for edge reconnect)
     print(f"\n[Registration] Registering client '{client_name}' with coordinator...")
-    
-    # Check if API key already exists
+
     api_key = get_api_key()
-    if api_key:
-        print(f"[Registration] Using existing API key from CLIENT_API_KEY")
-        client_id = client_name
-    else:
-        try:
-            client_id, api_key = register_client(client_name)
-            print(f"[Registration] Successfully registered as '{client_id}'")
-            print(f"[Registration] API Key: {api_key}")
-            print(f"[Registration] ⚠️  IMPORTANT: Save this API key!")
-            print(f"[Registration] Set it as: export CLIENT_API_KEY='{api_key}'")
-        except CoordinatorConnectionError as e:
-            print(f"[Registration] ERROR: Cannot connect to coordinator: {e}")
-            print(f"[Registration] Please ensure the coordinator is running at {config.COORDINATOR_URL}")
+    try:
+        client_id, api_key = register_client(client_name)
+        save_api_key(api_key)
+        print(f"[Registration] Registered as '{client_id}'")
+        print(f"[Registration] API key saved to client data store")
+    except CoordinatorConnectionError as e:
+        print(f"[Registration] ERROR: Cannot connect to coordinator: {e}")
+        print(f"[Registration] Please ensure the coordinator is running at {config.COORDINATOR_URL}")
+        sys.exit(1)
+    except CoordinatorAPIError as e:
+        if api_key:
+            print(f"[Registration] Using cached API key after register error: {e}")
+            client_id = client_name
+        else:
+            print(f"[Registration] ERROR: Registration failed: {e}")
             sys.exit(1)
-        except CoordinatorAPIError as e:
-            # If client already exists, try to continue with the same name
-            if "already registered" in str(e).lower():
-                print(f"[Registration] Client already registered, but no API key found!")
-                print(f"[Registration] ERROR: CLIENT_API_KEY environment variable is required.")
-                print(f"[Registration] Please set CLIENT_API_KEY or re-register the client.")
-                sys.exit(1)
-            else:
-                print(f"[Registration] ERROR: Registration failed: {e}")
-                sys.exit(1)
     
     log_event(logger, "client_started", client_id=client_id, extra_fields={
         "coordinator_url": config.COORDINATOR_URL,
