@@ -243,3 +243,46 @@ def get_lora_round(round_id: int, api_key: Optional[str] = None) -> Dict[str, An
     response = _make_request("GET", url, params=params)
     return response.json()
 
+
+def claim_job(
+    client_id: str,
+    api_key: Optional[str] = None,
+    types: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Claim next general job from the coordinator queue."""
+    if api_key is None:
+        api_key = get_api_key()
+    url = f"{config.COORDINATOR_URL}/jobs/claim"
+    params: Dict[str, Any] = {"client_id": client_id}
+    if api_key:
+        params["api_key"] = api_key
+    if types:
+        params["types"] = types
+    response = _make_request("GET", url, params=params)
+    data = response.json()
+    return data.get("job")
+
+
+def submit_job_result(
+    job_id: str,
+    client_id: str,
+    result: Dict[str, Any],
+    api_key: Optional[str] = None,
+    success: bool = True,
+    error: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Submit result for a claimed general job."""
+    if api_key is None:
+        api_key = get_api_key()
+    url = f"{config.COORDINATOR_URL}/jobs/{job_id}/result"
+    payload: Dict[str, Any] = {
+        "client_id": client_id,
+        "result": result,
+        "success": success,
+        "error": error,
+    }
+    if api_key:
+        payload["api_key"] = api_key
+    response = _make_request("POST", url, json=payload)
+    return response.json()
+

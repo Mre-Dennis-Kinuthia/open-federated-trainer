@@ -61,6 +61,35 @@ export type Overview = {
   lora_base_models: string[];
   lora_rounds: LoraRound[];
   registered_clients: string[];
+  jobs?: Array<{
+    job_id: string;
+    job_type: string;
+    state: string;
+    assigned_client?: string | null;
+    error?: string | null;
+    result?: Record<string, unknown>;
+  }>;
+  job_stats?: { total?: number; counts?: Record<string, number> };
+  classic_models?: Record<string, unknown>;
+  active_model?: { model_id?: string; model_config?: Record<string, unknown> };
+  launcher?: {
+    enabled?: boolean;
+    running?: number;
+    total?: number;
+    by_kind?: { train?: number; worker?: number };
+    processes?: Array<{
+      id: string;
+      kind: string;
+      name: string;
+      pid: number;
+      running: boolean;
+      exit_code?: number | null;
+      env_summary?: Record<string, string>;
+      uptime_seconds?: number | null;
+      log_path?: string | null;
+    }>;
+    dataset_presets?: string[];
+  };
 };
 
 export type CreateLoraPayload = {
@@ -119,4 +148,70 @@ export function aggregateLoraRound(roundId: number): Promise<unknown> {
     method: "POST",
     body: JSON.stringify({ round_id: roundId, weight_by_samples: true }),
   });
+}
+
+export function createJob(
+  jobType: string,
+  payload: Record<string, unknown>
+): Promise<unknown> {
+  return request(`/jobs${operatorQuery()}`, {
+    method: "POST",
+    body: JSON.stringify({ job_type: jobType, payload }),
+  });
+}
+
+export function setActiveModel(
+  modelId: string,
+  modelConfig?: Record<string, unknown>
+): Promise<unknown> {
+  return request(`/models/active${operatorQuery()}`, {
+    method: "POST",
+    body: JSON.stringify({ model_id: modelId, model_config: modelConfig ?? {} }),
+  });
+}
+
+export type LaunchPayload = {
+  kind: "train" | "worker";
+  count?: number;
+  model_id?: string;
+  model_module?: string;
+  dataset_preset?: string;
+  dataset_path?: string;
+  job_types?: string;
+  set_active_model?: boolean;
+  enqueue_sample_job?: boolean;
+};
+
+export function launchProcess(payload: LaunchPayload): Promise<unknown> {
+  return request(`/launch${operatorQuery()}`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function launchDemo(payload: {
+  model_id?: string;
+  dataset_preset?: string;
+  train_clients?: number;
+  start_worker?: boolean;
+  enqueue_sample_job?: boolean;
+}): Promise<unknown> {
+  return request(`/launch/demo${operatorQuery()}`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function stopLaunch(processId: string): Promise<unknown> {
+  return request(`/launch/${processId}/stop${operatorQuery()}`, {
+    method: "POST",
+  });
+}
+
+export function stopAllLaunch(kind?: string): Promise<unknown> {
+  const params = new URLSearchParams();
+  if (OPERATOR_KEY) params.set("operator_key", OPERATOR_KEY);
+  if (kind) params.set("kind", kind);
+  const q = params.toString() ? `?${params.toString()}` : "";
+  return request(`/launch/stop-all${q}`, { method: "POST" });
 }

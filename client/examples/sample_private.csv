@@ -1,0 +1,7 @@
+text,label
+Federated learning keeps raw records on the device,0
+Volunteer nodes contribute weight updates only,1
+Edge cameras can fine-tune locally overnight,0
+Private hospital notes never leave the ward network,1
+LoRA adapters shrink what must be synchronized,0
+Science compute chunks return summaries not datasets,1

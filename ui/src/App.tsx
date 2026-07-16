@@ -2,23 +2,33 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   aggregateClassicRound,
   aggregateLoraRound,
+  createJob,
   createLoraRound,
   fetchOverview,
+  launchDemo,
+  launchProcess,
+  setActiveModel,
+  stopAllLaunch,
+  stopLaunch,
   type CreateLoraPayload,
   type Overview,
 } from "./api";
 import { ClientsPanel } from "./components/ClientsPanel";
+import { JobsPanel } from "./components/JobsPanel";
+import { LaunchPanel } from "./components/LaunchPanel";
 import { LoraPanel } from "./components/LoraPanel";
 import { RoundsTable } from "./components/RoundsTable";
 import { historyFromValue, Sparkline } from "./components/Sparkline";
 
-type Tab = "overview" | "rounds" | "clients" | "lora";
+type Tab = "overview" | "launch" | "rounds" | "clients" | "lora" | "jobs";
 
 const NAV: { id: Tab; label: string; section?: string }[] = [
   { id: "overview", label: "Overview" },
+  { id: "launch", label: "Launch", section: "Run" },
   { id: "rounds", label: "Rounds", section: "Training" },
   { id: "clients", label: "Clients", section: "Training" },
   { id: "lora", label: "LoRA", section: "Training" },
+  { id: "jobs", label: "Jobs", section: "Work queue" },
 ];
 
 function Icon({ d }: { d: string }) {
@@ -31,9 +41,11 @@ function Icon({ d }: { d: string }) {
 
 const ICONS: Record<Tab, string> = {
   overview: "M3 10.5L12 3l9 7.5V20a1 1 0 01-1 1h-5v-6H9v6H4a1 1 0 01-1-1v-9.5z",
+  launch: "M5 12h14M12 5l7 7-7 7",
   rounds: "M4 7h16M4 12h16M4 17h10",
   clients: "M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8z",
   lora: "M12 3l2.5 6.5L21 11l-5 4.5L17.5 22 12 18.5 6.5 22 8 15.5 3 11l6.5-1.5L12 3z",
+  jobs: "M4 6h16v4H4V6zm0 8h7v4H4v-4zm9 0h7v4h-7v-4z",
 };
 
 export default function App() {
@@ -44,6 +56,8 @@ export default function App() {
   const [busyClassic, setBusyClassic] = useState<number | null>(null);
   const [busyLora, setBusyLora] = useState<number | null>(null);
   const [creating, setCreating] = useState(false);
+  const [creatingJob, setCreatingJob] = useState(false);
+  const [launchBusy, setLaunchBusy] = useState(false);
   const [stateFilter, setStateFilter] = useState("all");
   const online = data !== null && !error;
   const prevFailed = useRef<number | null>(null);
@@ -107,6 +121,126 @@ export default function App() {
       setError(e instanceof Error ? e.message : "LoRA aggregate failed");
     } finally {
       setBusyLora(null);
+    }
+  }
+
+  async function handleCreateJob(jobType: string, payload: Record<string, unknown>) {
+    setCreatingJob(true);
+    try {
+      await createJob(jobType, payload);
+      setToast(`Enqueued ${jobType} job`);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Create job failed");
+    } finally {
+      setCreatingJob(false);
+    }
+  }
+
+  async function handleSetModel(modelId: string) {
+    try {
+      await setActiveModel(modelId);
+      setToast(`Active model → ${modelId}`);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Set model failed");
+    }
+  }
+
+  async function handleStartDemo(opts: {
+    modelId: string;
+    datasetPreset: string;
+    trainClients: number;
+  }) {
+    setLaunchBusy(true);
+    try {
+      await launchDemo({
+        model_id: opts.modelId,
+        dataset_preset: opts.datasetPreset,
+        train_clients: opts.trainClients,
+        start_worker: true,
+        enqueue_sample_job: true,
+      });
+      setToast(
+        `Started ${opts.trainClients} train client(s) + worker · model ${opts.modelId}`
+      );
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Launch demo failed");
+    } finally {
+      setLaunchBusy(false);
+    }
+  }
+
+  async function handleStartTrain(opts: {
+    count: number;
+    modelId: string;
+    datasetPreset: string;
+  }) {
+    setLaunchBusy(true);
+    try {
+      await launchProcess({
+        kind: "train",
+        count: opts.count,
+        model_id: opts.modelId,
+        dataset_preset: opts.datasetPreset,
+        set_active_model: true,
+      });
+      setToast(`Started ${opts.count} train client(s)`);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Start train failed");
+    } finally {
+      setLaunchBusy(false);
+    }
+  }
+
+  async function handleStartWorker(opts: {
+    jobTypes: string;
+    datasetPreset: string;
+    enqueueSample: boolean;
+  }) {
+    setLaunchBusy(true);
+    try {
+      await launchProcess({
+        kind: "worker",
+        count: 1,
+        job_types: opts.jobTypes,
+        dataset_preset: opts.datasetPreset,
+        enqueue_sample_job: opts.enqueueSample,
+      });
+      setToast("Started job worker");
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Start worker failed");
+    } finally {
+      setLaunchBusy(false);
+    }
+  }
+
+  async function handleStopLaunch(id: string) {
+    setLaunchBusy(true);
+    try {
+      await stopLaunch(id);
+      setToast("Stopped process");
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Stop failed");
+    } finally {
+      setLaunchBusy(false);
+    }
+  }
+
+  async function handleStopAllLaunch() {
+    setLaunchBusy(true);
+    try {
+      await stopAllLaunch();
+      setToast("Stopped all local processes");
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Stop all failed");
+    } finally {
+      setLaunchBusy(false);
     }
   }
 
@@ -176,9 +310,11 @@ export default function App() {
           <div className="topbar-row">
             <h1>
               {tab === "overview" && "Observability"}
+              {tab === "launch" && "Launch"}
               {tab === "rounds" && "Rounds"}
               {tab === "clients" && "Clients"}
               {tab === "lora" && "LoRA"}
+              {tab === "jobs" && "Jobs"}
             </h1>
             <div className="topbar-actions">
               <select className="select" defaultValue="local" aria-label="Environment">
@@ -209,6 +345,37 @@ export default function App() {
                 <button className="btn black" type="button" onClick={() => void refresh()}>
                   Refresh
                 </button>
+              </div>
+
+              <div className="card" style={{ marginBottom: 16 }}>
+                <div className="card-hd">
+                  <h2>Classic architecture</h2>
+                </div>
+                <div className="card-bd" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  {Object.keys(data?.classic_models ?? { simple_mlp: {}, tiny_cnn: {}, custom: {} }).map(
+                    (id) => (
+                      <button
+                        key={id}
+                        type="button"
+                        className={`btn${data?.active_model?.model_id === id ? " primary" : ""}`}
+                        onClick={() => void handleSetModel(id)}
+                      >
+                        {id}
+                      </button>
+                    )
+                  )}
+                  <span className="mono" style={{ alignSelf: "center" }}>
+                    active: {data?.active_model?.model_id ?? "simple_mlp"}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn black"
+                    style={{ marginLeft: "auto" }}
+                    onClick={() => setTab("launch")}
+                  >
+                    Open Launch
+                  </button>
+                </div>
               </div>
 
               <div className="metrics">
@@ -368,6 +535,22 @@ export default function App() {
             </>
           )}
 
+          {tab === "launch" && (
+            <LaunchPanel
+              launcher={data?.launcher}
+              models={Object.keys(
+                data?.classic_models ?? { simple_mlp: {}, tiny_cnn: {}, custom: {} }
+              )}
+              activeModel={data?.active_model?.model_id}
+              busy={launchBusy}
+              onStartDemo={handleStartDemo}
+              onStartTrain={handleStartTrain}
+              onStartWorker={handleStartWorker}
+              onStop={handleStopLaunch}
+              onStopAll={handleStopAllLaunch}
+            />
+          )}
+
           {tab === "rounds" && (
             <>
               <div className="filters">
@@ -411,6 +594,15 @@ export default function App() {
               creating={creating}
               onCreate={handleCreateLora}
               onAggregate={handleAggregateLora}
+            />
+          )}
+
+          {tab === "jobs" && (
+            <JobsPanel
+              jobs={data?.jobs ?? []}
+              stats={data?.job_stats}
+              onCreate={handleCreateJob}
+              creating={creatingJob}
             />
           )}
         </div>

@@ -248,6 +248,8 @@ The UI polls `GET /dashboard/overview` every 3s and can aggregate classic rounds
 
 For volunteer/edge production hardening (durable auth, FedAvg, auto-aggregate, operator keys), see **[PRODUCTION.md](./PRODUCTION.md)**.
 
+For custom models, private datasets, and non-training jobs (inference / label / compute), see **[EXTENSIBILITY.md](./EXTENSIBILITY.md)**.
+
 ### Verify It's Working
 
 1. **Health:**

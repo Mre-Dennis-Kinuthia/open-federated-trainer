@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
@@ -25,6 +25,8 @@ from core.async_round_manager import AsyncRoundManager, AsyncRoundConfig
 from core.reputation import ReputationManager
 from core.incentives import IncentiveManager
 from core.state_store import StateStore
+from jobs import get_job_queue
+from core.local_launcher import get_local_launcher
 from model_registry.base_models import BaseModelRegistry
 from rounds import create_lora_round, get_lora_round, close_lora_round
 from rounds.create_round import get_lora_round_manager
@@ -149,6 +151,37 @@ incentive_manager = IncentiveManager(
 base_model_registry = BaseModelRegistry()
 lora_round_manager = get_lora_round_manager()
 adapter_store = ModelStore(models_dir=str(Path(__file__).parent.parent.parent / "adapters"))
+job_queue = get_job_queue()
+local_launcher = get_local_launcher()
+
+# Built-in classic FL architectures advertised to clients/UI
+CLASSIC_MODEL_CATALOG = {
+    "simple_mlp": {
+        "description": "Built-in MLP (default federated trainer)",
+        "config_schema": {
+            "num_epochs": 3,
+            "batch_size": 32,
+            "learning_rate": 0.01,
+            "input_dim": 10,
+            "hidden_dim": 32,
+            "output_dim": 1,
+        },
+    },
+    "tiny_cnn": {
+        "description": "Built-in tiny CNN for image-like tensors",
+        "config_schema": {
+            "channels": 1,
+            "image_size": 8,
+            "num_classes": 2,
+            "num_epochs": 2,
+            "learning_rate": 0.01,
+        },
+    },
+    "custom": {
+        "description": "Load Trainer from client MODEL_MODULE=pkg.mod:Class",
+        "config_schema": {},
+    },
+}
 
 
 def _require_operator(operator_key: Optional[str]) -> None:
@@ -174,10 +207,62 @@ class ClientRegisterResponse(BaseModel):
 
 class TaskResponse(BaseModel):
     """Response model for task assignment."""
+    model_config = ConfigDict(populate_by_name=True)
+
     round_id: int
     model_version: str  # Changed to string format: "v1", "v2", etc.
     task: str
     description: str
+    model_id: str = "simple_mlp"
+    architecture_config: Dict[str, Any] = Field(default_factory=dict, alias="model_config")
+
+
+class SetModelRequest(BaseModel):
+    """Select architecture for classic FL rounds."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    model_id: str
+    architecture_config: Optional[Dict[str, Any]] = Field(default=None, alias="model_config")
+
+
+class CreateJobRequest(BaseModel):
+    """Create a general (non-training) job."""
+    job_type: str  # inference | label | compute
+    payload: Optional[Dict[str, Any]] = None
+    priority: int = 0
+    tags: Optional[list] = None
+
+
+class LaunchRequest(BaseModel):
+    """Start local train clients or job workers from the ops UI."""
+    kind: str  # train | worker
+    count: int = 1
+    model_id: Optional[str] = None
+    model_module: Optional[str] = None
+    dataset_preset: str = "none"
+    dataset_path: Optional[str] = None
+    job_types: str = "inference,label,compute"
+    client_name_prefix: Optional[str] = None
+    set_active_model: bool = True
+    enqueue_sample_job: bool = False
+
+
+class LaunchDemoRequest(BaseModel):
+    """One-click local demo: model + clients + worker + sample job."""
+    model_id: str = "tiny_cnn"
+    dataset_preset: str = "sample_private"
+    train_clients: int = 2
+    start_worker: bool = True
+    enqueue_sample_job: bool = True
+
+
+class JobResultRequest(BaseModel):
+    """Submit result for a claimed job."""
+    client_id: str
+    api_key: Optional[str] = None
+    result: Dict[str, Any]
+    success: bool = True
+    error: Optional[str] = None
 
 
 class UpdateRequest(BaseModel):
@@ -387,7 +472,9 @@ async def get_task(
         round_id=task["round_id"],
         model_version=task["model_version"],
         task=task["task"],
-        description=task["description"]
+        description=task["description"],
+        model_id=task.get("model_id", "simple_mlp"),
+        model_config=task.get("model_config") or {},
     )
 
 
@@ -785,6 +872,14 @@ async def dashboard_overview(limit: int = Query(25, ge=1, le=100)) -> Dict[str, 
         "lora_base_models": base_model_registry.list_models(),
         "lora_rounds": lora_round_manager.list_rounds(limit=limit),
         "registered_clients": sorted(list(round_manager.clients)),
+        "jobs": job_queue.list_jobs(limit=min(limit, 25)),
+        "job_stats": job_queue.stats(),
+        "classic_models": CLASSIC_MODEL_CATALOG,
+        "active_model": {
+            "model_id": task_assigner.model_id,
+            "model_config": task_assigner.model_config,
+        },
+        "launcher": local_launcher.status(),
     }
 
 
@@ -1083,7 +1178,250 @@ async def health() -> Dict[str, Any]:
         "async_enabled": enable_async,
         "registered_clients": len(round_manager.clients),
         "operator_auth_required": get_operator_api_key() is not None,
+        "job_queue": job_queue.stats(),
+        "active_model_id": task_assigner.model_id,
     }
+
+
+@app.get("/models")
+async def list_models() -> Dict[str, Any]:
+    """List classic FL architectures and LoRA base models."""
+    return {
+        "classic": CLASSIC_MODEL_CATALOG,
+        "active_classic": {
+            "model_id": task_assigner.model_id,
+            "model_config": task_assigner.model_config,
+            "model_version": task_assigner.model_version,
+        },
+        "lora_base_models": base_model_registry.list_models(),
+    }
+
+
+@app.post("/models/active")
+async def set_active_model(
+    request: SetModelRequest,
+    operator_key: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    """Select which classic architecture new FL rounds use."""
+    _require_operator(operator_key)
+    if request.model_id not in CLASSIC_MODEL_CATALOG and request.model_id != "custom":
+        # Allow unknown ids for custom plugins advertised by operators
+        pass
+    task_assigner.set_model(request.model_id, request.architecture_config)
+    return {
+        "success": True,
+        "model_id": task_assigner.model_id,
+        "model_config": task_assigner.model_config,
+    }
+
+
+@app.post("/jobs")
+async def create_job(
+    request: CreateJobRequest,
+    operator_key: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    """Enqueue a non-training job (inference | label | compute)."""
+    _require_operator(operator_key)
+    allowed = {"inference", "label", "compute"}
+    if request.job_type not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"job_type must be one of {sorted(allowed)}",
+        )
+    job = job_queue.create_job(
+        job_type=request.job_type,
+        payload=request.payload,
+        priority=request.priority,
+        tags=request.tags,
+    )
+    return job.to_dict()
+
+
+@app.get("/jobs")
+async def list_jobs(
+    state: Optional[str] = None,
+    job_type: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+) -> Dict[str, Any]:
+    """List jobs in the general queue."""
+    return {
+        "jobs": job_queue.list_jobs(state=state, job_type=job_type, limit=limit),
+        "stats": job_queue.stats(),
+    }
+
+
+@app.get("/jobs/claim")
+async def claim_job(
+    client_id: str,
+    api_key: Optional[str] = Query(None),
+    types: Optional[str] = Query(
+        None,
+        description="Comma-separated job types, e.g. inference,compute",
+    ),
+) -> Dict[str, Any]:
+    """Claim the next queued job for a volunteer/edge client."""
+    if not auth_manager.validate_api_key(api_key, client_id):
+        raise HTTPException(status_code=401, detail="Authentication failed")
+    type_set = None
+    if types:
+        type_set = {t.strip() for t in types.split(",") if t.strip()}
+    job = job_queue.claim_next(client_id, job_types=type_set)
+    if job is None:
+        return {"job": None, "message": "No jobs available"}
+    return {"job": job.to_dict()}
+
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str) -> Dict[str, Any]:
+    job = job_queue.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job.to_dict()
+
+
+@app.post("/jobs/{job_id}/result")
+async def submit_job_result(job_id: str, request: JobResultRequest) -> Dict[str, Any]:
+    """Submit results for a claimed job (private data stays on client)."""
+    if not auth_manager.validate_api_key(request.api_key, request.client_id):
+        raise HTTPException(status_code=401, detail="Authentication failed")
+    job = job_queue.submit_result(
+        job_id=job_id,
+        client_id=request.client_id,
+        result=request.result,
+        success=request.success,
+        error=request.error,
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found or not assigned to client")
+    return job.to_dict()
+
+
+@app.get("/launch")
+async def launch_status() -> Dict[str, Any]:
+    """List UI-started local clients/workers."""
+    return local_launcher.status()
+
+
+@app.post("/launch")
+async def launch_process(
+    request: LaunchRequest,
+    operator_key: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    """Start local train clients or job workers (dev/ops UI)."""
+    _require_operator(operator_key)
+    if not local_launcher.enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="Local launcher disabled. Set ENABLE_LOCAL_LAUNCHER=true",
+        )
+    try:
+        if request.set_active_model and request.kind == "train" and request.model_id:
+            task_assigner.set_model(request.model_id, None)
+        started = local_launcher.start(
+            kind=request.kind,
+            count=request.count,
+            model_id=request.model_id,
+            model_module=request.model_module,
+            dataset_preset=request.dataset_preset,
+            dataset_path=request.dataset_path,
+            job_types=request.job_types,
+            client_name_prefix=request.client_name_prefix,
+        )
+        sample_job = None
+        if request.enqueue_sample_job and request.kind == "worker":
+            sample_job = job_queue.create_job(
+                "compute",
+                {"formula": "monte_carlo_pi", "seed": int(time.time()) % 10000, "steps": 80000},
+            ).to_dict()
+        return {
+            "success": True,
+            "started": started,
+            "launcher": local_launcher.status(),
+            "sample_job": sample_job,
+            "active_model": {
+                "model_id": task_assigner.model_id,
+                "model_config": task_assigner.model_config,
+            },
+        }
+    except (ValueError, FileNotFoundError, RuntimeError) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/launch/demo")
+async def launch_demo(
+    request: LaunchDemoRequest,
+    operator_key: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    """One-click: set model, start train clients + worker, enqueue sample job."""
+    _require_operator(operator_key)
+    if not local_launcher.enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="Local launcher disabled. Set ENABLE_LOCAL_LAUNCHER=true",
+        )
+    try:
+        task_assigner.set_model(request.model_id, None)
+        started = []
+        started.extend(
+            local_launcher.start(
+                kind="train",
+                count=request.train_clients,
+                model_id=request.model_id,
+                dataset_preset=request.dataset_preset,
+                client_name_prefix="ui-train",
+            )
+        )
+        if request.start_worker:
+            started.extend(
+                local_launcher.start(
+                    kind="worker",
+                    count=1,
+                    dataset_preset=request.dataset_preset,
+                    job_types="inference,label,compute",
+                    client_name_prefix="ui-worker",
+                )
+            )
+        sample_job = None
+        if request.enqueue_sample_job:
+            sample_job = job_queue.create_job(
+                "compute",
+                {
+                    "formula": "monte_carlo_pi",
+                    "seed": int(time.time()) % 10000,
+                    "steps": 100000,
+                },
+            ).to_dict()
+        return {
+            "success": True,
+            "started": started,
+            "sample_job": sample_job,
+            "active_model": {"model_id": task_assigner.model_id},
+            "launcher": local_launcher.status(),
+        }
+    except (ValueError, FileNotFoundError, RuntimeError) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/launch/{process_id}/stop")
+async def stop_launch(
+    process_id: str,
+    operator_key: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    _require_operator(operator_key)
+    ok = local_launcher.stop(process_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Process not found or already stopped")
+    return {"success": True, "launcher": local_launcher.status()}
+
+
+@app.post("/launch/stop-all")
+async def stop_all_launch(
+    kind: Optional[str] = Query(None),
+    operator_key: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    _require_operator(operator_key)
+    n = local_launcher.stop_all(kind=kind)
+    return {"success": True, "stopped": n, "launcher": local_launcher.status()}
 
 
 @app.get("/")
@@ -1097,6 +1435,17 @@ async def root():
         "aggregate_round": "GET /aggregate/{round_id}",
         "get_round_status": "GET /status/{round_id}",
         "get_model": "GET /model/{version}",
+        "list_models": "GET /models",
+        "set_active_model": "POST /models/active",
+        "create_job": "POST /jobs",
+        "list_jobs": "GET /jobs",
+        "claim_job": "GET /jobs/claim",
+        "submit_job_result": "POST /jobs/{job_id}/result",
+        "launch_status": "GET /launch",
+        "launch_start": "POST /launch",
+        "launch_demo": "POST /launch/demo",
+        "launch_stop": "POST /launch/{process_id}/stop",
+        "launch_stop_all": "POST /launch/stop-all",
         "get_all_metrics": "GET /metrics",
         "get_latest_metrics": "GET /metrics/latest",
         "get_round_metrics": "GET /metrics/round/{round_id}",
@@ -1114,7 +1463,7 @@ async def root():
     
     return {
         "message": "Federated Learning Coordinator API",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "async_enabled": enable_async,
         "endpoints": endpoints
     }

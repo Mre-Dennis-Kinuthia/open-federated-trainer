@@ -599,6 +599,13 @@ select {
   color: var(--text-secondary);
 }
 
+.help {
+  margin: 0 0 14px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .btn {
   border: 1px solid var(--border);
   background: var(--bg);

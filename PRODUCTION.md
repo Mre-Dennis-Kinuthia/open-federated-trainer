@@ -14,6 +14,9 @@ This document tracks what was hardened toward production use and what remains.
 8. **Health** — `GET /health` for orchestration
 9. **Docker volumes** — models, metrics, logs, data, adapters; client key volume; restart policies
 10. **LoRA client** — fixed `get_base_model_name`; persists API key
+11. **Pluggable models** — `simple_mlp` / `tiny_cnn` / `MODEL_MODULE` custom trainers (see EXTENSIBILITY.md)
+12. **Private datasets** — CSV / JSONL / JSON / folder / HuggingFace via `DATASET_PATH` (data stays on client)
+13. **Non-training jobs** — inference / label / compute queue + `worker.py`
 
 ## Still required for full production fleet
 
@@ -26,7 +29,8 @@ This document tracks what was hardened toward production use and what remains.
 | LoRA | Download prior adapters; real eval loss; upload retries |
 | Observability | Prometheus metrics; structured log shipping |
 | Scale | Multi-coordinator / Redis-backed state for HA |
-| Data | Real local datasets instead of synthetic generators |
+| Data | Optional DP; richer feature extractors (beyond CSV/JSONL/HF loaders) |
+| Jobs | Persist job queue across coordinator restarts (currently in-memory) |
 
 ## Recommended operator env
 

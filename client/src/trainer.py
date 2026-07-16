@@ -149,32 +149,14 @@ def train_local_model(
     input_dim: int = 10,
     hidden_dim: int = 32,
     output_dim: int = 1,
-    seed: Optional[int] = None
+    seed: Optional[int] = None,
+    data: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> str:
     """
     Perform local PyTorch-based model training and return weight delta.
-    
-    This function:
-    1. Creates a simple MLP model
-    2. Generates fake local training data
-    3. Trains the model using SGD/Adam
-    4. Computes weight delta (difference from initial weights)
-    5. Serializes delta to JSON string for coordinator
-    
-    Args:
-        task: Task dictionary containing round_id, model_version, task, description
-        client_id: Optional client identifier for reproducibility
-        num_epochs: Number of training epochs (default: 3)
-        batch_size: Batch size for training (default: 32)
-        learning_rate: Learning rate for optimizer (default: 0.01)
-        num_samples: Number of fake training samples (default: 100)
-        input_dim: Input dimension for MLP (default: 10)
-        hidden_dim: Hidden layer dimension (default: 32)
-        output_dim: Output dimension (default: 1)
-        seed: Random seed for reproducibility (uses hash of client_id + round_id if None)
-        
-    Returns:
-        Weight delta as JSON-serialized string
+
+    Uses ``data=(X, y)`` when provided (private local dataset); otherwise
+    falls back to synthetic features for demos.
     """
     round_id = task.get("round_id", 0)
     model_version = task.get("model_version", "v1")
@@ -190,6 +172,18 @@ def train_local_model(
         np.random.seed(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+    if data is not None:
+        X_train, y_train = data
+        if X_train.dim() != 2:
+            raise ValueError("X must be 2D (num_samples, input_dim)")
+        input_dim = int(X_train.size(1))
+        num_samples = int(X_train.size(0))
+        if y_train.dim() == 1:
+            y_train = y_train.unsqueeze(1)
+        output_dim = int(y_train.size(1)) if y_train.dim() == 2 else output_dim
+    else:
+        X_train, y_train = _generate_fake_data(num_samples, input_dim, seed)
     
     # Create model
     model = SimpleMLP(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim)
@@ -198,20 +192,18 @@ def train_local_model(
     initial_model = SimpleMLP(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim)
     initial_model.load_state_dict(model.state_dict())
     
-    # Generate fake training data
-    X_train, y_train = _generate_fake_data(num_samples, input_dim, seed)
-    
     # Setup loss function and optimizer
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
     # Training loop
     model.train()
+    loss = None
     for epoch in range(num_epochs):
         # Simple batch training (for MVP, we use all data)
         optimizer.zero_grad()
         outputs = model(X_train)
-        loss = criterion(outputs, y_train)
+        loss = criterion(outputs, y_train.float())
         loss.backward()
         optimizer.step()
     
@@ -233,9 +225,10 @@ def train_local_model(
             "num_epochs": num_epochs,
             "batch_size": batch_size,
             "learning_rate": learning_rate,
-            "num_samples": num_samples
+            "num_samples": num_samples,
+            "data_source": "private" if data is not None else "synthetic",
         },
-        "final_loss": float(loss.item())
+        "final_loss": float(loss.item()) if loss is not None else 0.0,
     }
     
     # Serialize to JSON string

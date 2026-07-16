@@ -1,48 +1,22 @@
 """
 Dataset Loader Module
 
-Loads local datasets for LoRA fine-tuning.
-Supports various formats and provides a simple interface.
+Loads local private datasets for LoRA fine-tuning via the shared datasets package.
 """
 
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
-import torch
-from torch.utils.data import Dataset, DataLoader
+import os
+
+from datasets import load_local_dataset as load_private_dataset
 
 
 @dataclass
 class DatasetConfig:
     """Configuration for dataset loading."""
-    max_samples: Optional[int] = None  # Limit number of samples
+    max_samples: Optional[int] = None
     shuffle: bool = True
     seed: Optional[int] = None
-
-
-class SimpleTextDataset(Dataset):
-    """
-    Simple text dataset for LoRA fine-tuning.
-    
-    For MVP, generates synthetic data. In production, this would
-    load real local datasets.
-    """
-    
-    def __init__(self, texts: List[str], max_length: int = 512):
-        """
-        Initialize dataset.
-        
-        Args:
-            texts: List of text strings
-            max_length: Maximum sequence length
-        """
-        self.texts = texts
-        self.max_length = max_length
-    
-    def __len__(self) -> int:
-        return len(self.texts)
-    
-    def __getitem__(self, idx: int) -> str:
-        return self.texts[idx]
 
 
 def load_local_dataset(
@@ -50,38 +24,27 @@ def load_local_dataset(
     config: Optional[DatasetConfig] = None
 ) -> Tuple[List[str], int]:
     """
-    Load local dataset for training.
-    
-    For MVP, generates synthetic data. In production, this would:
-    1. Load from dataset_path
-    2. Parse format (JSON, CSV, text, etc.)
-    3. Apply preprocessing
-    4. Return tokenized data
-    
-    Args:
-        dataset_path: Path to dataset file (optional, for future use)
-        config: Dataset configuration
-        
-    Returns:
-        Tuple of (texts, num_samples)
+    Load local private dataset for LoRA training.
+
+    Uses DATASET_PATH / DATASET_FORMAT env vars when dataset_path is omitted.
     """
     if config is None:
         config = DatasetConfig()
-    
-    # For MVP: Generate synthetic training data
-    # In production, load from dataset_path
-    synthetic_texts = [
-        "This is a sample training text for federated learning.",
-        "LoRA adapters enable efficient fine-tuning of large language models.",
-        "Federated learning preserves data privacy by keeping data local.",
-        "The coordinator aggregates adapter weights from multiple clients.",
-        "Each client trains on their own local dataset.",
-    ] * 20  # Repeat to get more samples
-    
-    if config.max_samples:
-        synthetic_texts = synthetic_texts[:config.max_samples]
-    
-    num_samples = len(synthetic_texts)
-    
-    return synthetic_texts, num_samples
 
+    path = dataset_path or os.getenv("DATASET_PATH") or None
+    ds = load_private_dataset(path=path)
+    texts = list(ds.texts)
+    if not texts and ds.rows:
+        texts = [str(r.get("text", r)) for r in ds.rows]
+
+    if config.max_samples:
+        texts = texts[: config.max_samples]
+
+    # Ensure non-empty for LoRA demos
+    if not texts:
+        texts = [
+            "Federated LoRA keeps base weights fixed and shares adapters only.",
+            "Private local text never leaves the volunteer or edge node.",
+        ] * 10
+
+    return texts, len(texts)

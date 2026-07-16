@@ -32,6 +32,17 @@ class Config:
     # Retry delay (in seconds)
     RETRY_DELAY: float = float(os.getenv("RETRY_DELAY", "2.0"))
 
+    # Pluggable model architecture (simple_mlp | tiny_cnn | custom | module:Class)
+    MODEL_ID: str = os.getenv("MODEL_ID", "simple_mlp")
+
+    # Private local dataset
+    DATASET_PATH: Optional[str] = os.getenv("DATASET_PATH", None)
+    DATASET_FORMAT: str = os.getenv("DATASET_FORMAT", "auto")
+
+    # General job worker: comma-separated types, or "train" only / "all"
+    # Examples: "train", "inference,compute", "all"
+    WORK_MODES: str = os.getenv("WORK_MODES", "train")
+
 
 # Global config instance
 config = Config()

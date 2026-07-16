@@ -24,6 +24,11 @@ Thumbs.db
 
 # Logs
 *.log
+coordinator/logs/
+
+# Runtime artifacts (local training / rounds)
+coordinator/metrics/
+coordinator/models/
 
 # Environment variables
 .env

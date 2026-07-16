@@ -21,10 +21,14 @@ from api import (
     fetch_task,
     submit_update,
     get_round_status,
+    claim_job,
+    submit_job_result,
     CoordinatorAPIError,
     CoordinatorConnectionError
 )
-from trainer import train_local_model_with_client_id
+from models import get_trainer
+from datasets import load_local_dataset
+from jobs import run_job
 from utils.logger import setup_client_logger, log_event
 from behavior import (
     simulate_startup_delay,
@@ -153,20 +157,35 @@ def run_client_loop(client_id: str, api_key: Optional[str] = None) -> None:
             
             round_id = task["round_id"]
             
-            # Step 2: Perform local training
+            # Step 2: Perform local training with pluggable model + private dataset
             print(f"[Client {client_id}] Starting local training for round {round_id}...")
+            model_id = task.get("model_id") or config.MODEL_ID
+            print(f"[Client {client_id}] Model: {model_id}")
             training_start_time = time.time()
             log_event(logger, "training_started", client_id=client_id, round_id=round_id)
             
             try:
-                weight_delta = train_local_model_with_client_id(task, client_id)
+                dataset = load_local_dataset(
+                    path=config.DATASET_PATH,
+                    fmt=config.DATASET_FORMAT,
+                )
+                print(
+                    f"[Client {client_id}] Dataset: {dataset.format} "
+                    f"source={dataset.source} n={dataset.num_samples}"
+                )
+                trainer = get_trainer(model_id)
+                result = trainer.train(task, dataset, client_id=client_id)
+                weight_delta = result.weight_delta
                 training_duration = time.time() - training_start_time
                 update_size_bytes = len(weight_delta.encode('utf-8'))
                 print(f"[Client {client_id}] Training completed. Weight delta: {weight_delta[:50]}...")
                 log_event(logger, "training_completed", client_id=client_id, round_id=round_id, extra_fields={
                     "training_duration_seconds": training_duration,
-                    "update_size_parameters": len(weight_delta),  # Approximate
-                    "update_size_bytes": update_size_bytes
+                    "update_size_parameters": len(weight_delta),
+                    "update_size_bytes": update_size_bytes,
+                    "model_id": model_id,
+                    "num_samples": result.num_samples,
+                    "dataset_source": dataset.source,
                 })
             except Exception as e:
                 print(f"[Client {client_id}] Training failed: {e}")
