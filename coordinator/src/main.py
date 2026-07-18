@@ -1033,8 +1033,43 @@ async def dashboard_overview(
     include_sensitive = True
     if get_operator_api_key() is not None:
         include_sensitive = validate_operator_key(operator_key)
+
+    # Multi-replica: reload durable rounds/clients so edge LB does not flip
+    # between an empty in-memory replica and a busy one.
+    round_manager.refresh_all_rounds()
+    # Overview client set must be durable-only (rounds/nodes), not local
+    # state_store — otherwise replica A (where clients register) reports
+    # extras that B never sees and the UI flickers under the edge LB.
+    clients_view: set = set()
+    for round_obj in round_manager.rounds.values():
+        clients_view.update(round_obj.assigned_clients)
+        clients_view.update(round_obj.updates_received)
+        round_manager.clients.update(round_obj.assigned_clients)
+        round_manager.clients.update(round_obj.updates_received)
+    try:
+        from persistence.json_repos import get_node_repository
+
+        for node in get_node_repository().list_nodes():
+            node_id = getattr(node, "node_id", None) or getattr(node, "client_id", None)
+            if node_id:
+                clients_view.add(str(node_id))
+                round_manager.clients.add(str(node_id))
+    except Exception:
+        pass
+
     all_metrics = metrics_collector.get_all_metrics()
-    global_metrics = all_metrics.get("global", {})
+    global_metrics = dict(all_metrics.get("global", {}) or {})
+    # Prefer durable counts (process-local metrics stay Approximate under HA).
+    durable_rounds = len(round_manager.rounds)
+    durable_clients = len(clients_view)
+    global_metrics["total_rounds"] = max(
+        int(global_metrics.get("total_rounds") or 0),
+        durable_rounds,
+    )
+    global_metrics["total_clients_seen"] = max(
+        int(global_metrics.get("total_clients_seen") or 0),
+        durable_clients,
+    )
     round_metrics_map = all_metrics.get("rounds", {})
 
     # Prefer live RoundManager state; fall back to metrics keys
@@ -1065,6 +1100,15 @@ async def dashboard_overview(
             classic_rounds.append({**status, "metrics": metrics})
 
     latest = metrics_collector.get_latest_round_metrics()
+    if not latest and classic_rounds:
+        head = classic_rounds[0]
+        latest = head.get("metrics") or {
+            "round_id": head.get("round_id"),
+            "model_version": head.get("model_version"),
+            "clients_assigned": head.get("total_clients"),
+            "updates_received": head.get("total_updates"),
+            "updates_accepted": head.get("total_updates"),
+        }
 
     return {
         "version": "1.0.0",
@@ -1079,7 +1123,7 @@ async def dashboard_overview(
         "lora_base_models": base_model_registry.list_models(),
         "lora_adapters": adapter_store.list_models(),
         "lora_rounds": lora_round_manager.list_rounds(limit=limit),
-        "registered_clients": sorted(list(round_manager.clients)),
+        "registered_clients": sorted(clients_view),
         "jobs": job_queue.list_jobs(
             limit=min(limit, 25),
             include_sensitive=include_sensitive,

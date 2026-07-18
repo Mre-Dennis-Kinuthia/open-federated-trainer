@@ -3,8 +3,10 @@
 #
 #   ./scripts/stop-local-trainers.sh   # optional: kill host ui-train clients on :8000
 #   ./scripts/gen-dev-certs.sh
-#   export OPERATOR_API_KEY="$(openssl rand -hex 16)"
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile production up -d --build
+#
+# Lab default: operator auth off (empty OPERATOR_API_KEY). To lock privileged
+# actions later: export OPERATOR_API_KEY=... and REQUIRE_OPERATOR_KEY=true
 #
 # API via TLS edge: https://localhost:8443  (HTTP :8080 redirects)
 # Train clients talk to coordinator-a/b on the Docker network (not the JSON :8000 service).
@@ -23,10 +25,13 @@ x-coordinator-env: &coordinator-env
   S3_ACCESS_KEY: fedcompute
   S3_SECRET_KEY: fedcompute-secret
   S3_REGION: us-east-1
-  REQUIRE_OPERATOR_KEY: "true"
-  OPERATOR_API_KEY: ${OPERATOR_API_KEY:?set OPERATOR_API_KEY}
-  CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost:8443,http://localhost:8080,http://127.0.0.1:8080}
+  # Open lab mode: no operator key required until you set OPERATOR_API_KEY.
+  REQUIRE_OPERATOR_KEY: ${REQUIRE_OPERATOR_KEY:-false}
+  OPERATOR_API_KEY: ${OPERATOR_API_KEY:-}
+  CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost:8443,http://localhost:8080,http://127.0.0.1:8080,http://localhost:5173,http://127.0.0.1:5173}
   SHARED_STATE: auto
+  # Spawn train/worker processes from the operator Launch page.
+  ALLOW_SYNTHETIC_DATA: ${ALLOW_SYNTHETIC_DATA:-true}
 
 x-coordinator-health: &coordinator-health
   test:
@@ -102,6 +107,14 @@ services:
     container_name: federated-coordinator-a
     environment:
       <<: *coordinator-env
+      ENABLE_LOCAL_LAUNCHER: ${ENABLE_LOCAL_LAUNCHER:-true}
+      CLIENT_ROOT: /client
+      CLIENT_PYTHON: python3
+      PUBLIC_COORDINATOR_URL: http://coordinator-a:8000
+      LAUNCH_LOG_DIR: /app/logs/launch
+    volumes:
+      - ./client:/client:ro
+      - ./coordinator/logs:/app/logs
     depends_on:
       postgres:
         condition: service_healthy
@@ -121,6 +134,15 @@ services:
     container_name: federated-coordinator-b
     environment:
       <<: *coordinator-env
+      # Same launcher surface as A so edge least_conn never flips the UI off.
+      ENABLE_LOCAL_LAUNCHER: ${ENABLE_LOCAL_LAUNCHER:-true}
+      CLIENT_ROOT: /client
+      CLIENT_PYTHON: python3
+      PUBLIC_COORDINATOR_URL: http://coordinator-a:8000
+      LAUNCH_LOG_DIR: /app/logs/launch
+    volumes:
+      - ./client:/client:ro
+      - ./coordinator/logs:/app/logs
     depends_on:
       postgres:
         condition: service_healthy

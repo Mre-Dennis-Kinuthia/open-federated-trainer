@@ -19,19 +19,28 @@ from typing import Any, Dict, List, Optional
 
 
 def _repo_root() -> Path:
-    # coordinator/src/core/local_launcher.py → repo root
+    override = os.getenv("FEDCOMPUTE_REPO_ROOT", "").strip()
+    if override:
+        return Path(override)
+    # coordinator/src/core/local_launcher.py → repo root (host layout)
     return Path(__file__).resolve().parents[3]
 
 
 def _client_root() -> Path:
+    override = os.getenv("CLIENT_ROOT", "").strip()
+    if override:
+        return Path(override)
     return _repo_root() / "client"
 
 
 def _client_python() -> Path:
+    explicit = os.environ.get("CLIENT_PYTHON", "").strip()
+    if explicit:
+        return Path(explicit)
     venv = _client_root() / "venv" / "bin" / "python"
     if venv.exists():
         return venv
-    return Path(os.environ.get("CLIENT_PYTHON", "python3"))
+    return Path("python3")
 
 
 def _coordinator_url() -> str:
@@ -39,6 +48,17 @@ def _coordinator_url() -> str:
         "PUBLIC_COORDINATOR_URL",
         os.getenv("COORDINATOR_URL", "http://127.0.0.1:8000"),
     )
+
+
+def _launch_log_dir() -> Path:
+    override = os.getenv("LAUNCH_LOG_DIR", "").strip()
+    if override:
+        return Path(override)
+    # Docker image layout uses /app/logs; host layout uses coordinator/logs.
+    docker_logs = Path("/app/logs/launch")
+    if Path("/app/src").is_dir():
+        return docker_logs
+    return _repo_root() / "coordinator" / "logs" / "launch"
 
 
 @dataclass
@@ -74,7 +94,7 @@ class LocalLauncher:
         self._lock = threading.Lock()
         self._procs: Dict[str, subprocess.Popen] = {}
         self._meta: Dict[str, ManagedProcess] = {}
-        self._log_dir = _repo_root() / "coordinator" / "logs" / "launch"
+        self._log_dir = _launch_log_dir()
         self._log_dir.mkdir(parents=True, exist_ok=True)
 
     @property

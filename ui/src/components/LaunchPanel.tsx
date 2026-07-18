@@ -86,8 +86,12 @@ export function LaunchPanel({
     <>
       {!enabled && (
         <div className="banner error spaced" role="alert">
-          Local launcher is disabled. Set ENABLE_LOCAL_LAUNCHER=true on the
-          coordinator to start processes from this page.
+          Local launcher is disabled on this API. Set{" "}
+          <code>ENABLE_LOCAL_LAUNCHER=true</code> on the coordinator (and mount{" "}
+          <code>CLIENT_ROOT</code> in Docker) to start processes from this page.
+          On the HA production profile, launcher is enabled on{" "}
+          <code>coordinator-a</code>; compose <code>client-1</code>/
+          <code>client-2</code> also train without using this panel.
         </div>
       )}
 
