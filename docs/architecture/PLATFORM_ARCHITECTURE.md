@@ -6,7 +6,7 @@ How the coordinator, TLS edge, local UI/launcher, and edge devices interact (HA 
 
 ---
 
-## System map
+## System map.
 
 | | |
 |---|---|
