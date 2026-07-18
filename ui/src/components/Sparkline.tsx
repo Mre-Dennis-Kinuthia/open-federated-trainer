@@ -2,10 +2,12 @@ type SparkProps = {
   seriesA: number[];
   seriesB?: number[];
   height?: number;
+  /** Accessible description, e.g. "Updates per round, latest 12". */
+  label: string;
 };
 
-/** Simple dual-line sparkline matching Vercel observability cards. */
-export function Sparkline({ seriesA, seriesB, height = 120 }: SparkProps) {
+/** Dual-line sparkline with an accessible text alternative. */
+export function Sparkline({ seriesA, seriesB, height = 120, label }: SparkProps) {
   const w = 320;
   const h = height;
   const pad = 8;
@@ -25,12 +27,25 @@ export function Sparkline({ seriesA, seriesB, height = 120 }: SparkProps) {
       .join(" ");
   }
 
+  const latest = seriesA.length ? seriesA[seriesA.length - 1] : 0;
+  const description = `${label}. Latest value ${latest}, maximum ${max}, ${seriesA.length} points.`;
+
+  if (seriesA.length === 0) {
+    return <div className="spark-empty">No data yet</div>;
+  }
+
   return (
-    <svg className="spark" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
+    <svg
+      className="spark"
+      viewBox={`0 0 ${w} ${h}`}
+      preserveAspectRatio="none"
+      role="img"
+      aria-label={description}
+    >
       <path
         d={path(seriesA)}
         fill="none"
-        stroke="#0070f3"
+        stroke="var(--chart-blue)"
         strokeWidth="2"
         vectorEffect="non-scaling-stroke"
       />
@@ -38,7 +53,7 @@ export function Sparkline({ seriesA, seriesB, height = 120 }: SparkProps) {
         <path
           d={path(seriesB)}
           fill="none"
-          stroke="#f5a623"
+          stroke="var(--chart-orange)"
           strokeWidth="2"
           vectorEffect="non-scaling-stroke"
         />

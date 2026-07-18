@@ -1,0 +1,15 @@
+---
+description: React UI truthfulness and a11y
+globs: ui/**/*.{ts,tsx,css}
+alwaysApply: false
+---
+
+# Frontend React
+
+- Light mode; Vercel-like console styling already established.
+- Never invent production stats; label demo vs live.
+- Distinguish online vs recently seen; completed jobs vs queue total.
+- Operator key: sessionStorage + `X-Operator-Key`, never URL query.
+- Confirm destructive actions; separate connection vs action errors.
+- Semantic tables, focus-visible, skip link, ARIA live for toasts, WCAG AA contrast.
+- Globe: real `/dashboard/activity` nodes only; arcs are visualization, not measured traffic.

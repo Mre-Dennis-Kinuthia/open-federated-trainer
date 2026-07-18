@@ -133,15 +133,60 @@ class ReputationManager:
     Manages client reputation across the federated learning system.
     
     Tracks client behavior and calculates reputation scores.
+    Optional SQL repo enables multi-replica shared state.
     """
     
-    def __init__(self):
+    def __init__(self, repo=None):
         """Initialize the reputation manager."""
+        self.repo = repo
         self.reputations: Dict[str, ClientReputation] = {}
         # Track round participation (client_id -> set of round_ids)
         self.client_rounds: Dict[str, set] = defaultdict(set)
         # Track round start times for latency calculation
         self.round_start_times: Dict[int, float] = {}
+        if self.repo is not None:
+            self._reload_from_repo()
+
+    def _reload_from_repo(self) -> None:
+        if self.repo is None:
+            return
+        for data in self.repo.list_all():
+            client_id = data["client_id"]
+            self.reputations[client_id] = ClientReputation(
+                client_id=client_id,
+                rounds_participated=int(data.get("rounds_participated", 0)),
+                rounds_completed=int(data.get("rounds_completed", 0)),
+                rounds_dropped=int(data.get("rounds_dropped", 0)),
+                updates_submitted=int(data.get("updates_submitted", 0)),
+                updates_accepted=int(data.get("updates_accepted", 0)),
+                updates_rejected=int(data.get("updates_rejected", 0)),
+                total_latency_seconds=float(data.get("total_latency_seconds", 0.0)),
+                latency_samples=int(data.get("latency_samples", 0)),
+                first_seen=data.get("first_seen"),
+                last_seen=data.get("last_seen"),
+            )
+            self.client_rounds[client_id] = set(data.get("client_rounds") or [])
+
+    def _persist(self, client_id: str) -> None:
+        if self.repo is None or client_id not in self.reputations:
+            return
+        rep = self.reputations[client_id]
+        self.repo.save(
+            {
+                "client_id": rep.client_id,
+                "rounds_participated": rep.rounds_participated,
+                "rounds_completed": rep.rounds_completed,
+                "rounds_dropped": rep.rounds_dropped,
+                "updates_submitted": rep.updates_submitted,
+                "updates_accepted": rep.updates_accepted,
+                "updates_rejected": rep.updates_rejected,
+                "total_latency_seconds": rep.total_latency_seconds,
+                "latency_samples": rep.latency_samples,
+                "first_seen": rep.first_seen,
+                "last_seen": rep.last_seen,
+            },
+            client_rounds=sorted(self.client_rounds.get(client_id, set())),
+        )
     
     def register_client(self, client_id: str) -> None:
         """
@@ -157,6 +202,7 @@ class ReputationManager:
             )
         
         self.reputations[client_id].last_seen = time.time()
+        self._persist(client_id)
     
     def record_round_participation(self, client_id: str, round_id: int) -> None:
         """
@@ -169,6 +215,7 @@ class ReputationManager:
         self.register_client(client_id)
         self.reputations[client_id].rounds_participated += 1
         self.client_rounds[client_id].add(round_id)
+        self._persist(client_id)
     
     def record_round_start(self, round_id: int) -> None:
         """
@@ -195,6 +242,7 @@ class ReputationManager:
             latency = time.time() - self.round_start_times[round_id]
             self.reputations[client_id].total_latency_seconds += latency
             self.reputations[client_id].latency_samples += 1
+        self._persist(client_id)
     
     def record_update_accepted(self, client_id: str, round_id: int) -> None:
         """
@@ -206,6 +254,7 @@ class ReputationManager:
         """
         self.register_client(client_id)
         self.reputations[client_id].updates_accepted += 1
+        self._persist(client_id)
     
     def record_update_rejected(self, client_id: str, round_id: int) -> None:
         """
@@ -217,6 +266,7 @@ class ReputationManager:
         """
         self.register_client(client_id)
         self.reputations[client_id].updates_rejected += 1
+        self._persist(client_id)
     
     def record_round_completion(self, client_id: str, round_id: int) -> None:
         """
@@ -229,6 +279,7 @@ class ReputationManager:
         self.register_client(client_id)
         if round_id in self.client_rounds[client_id]:
             self.reputations[client_id].rounds_completed += 1
+            self._persist(client_id)
     
     def record_round_dropout(self, client_id: str, round_id: int) -> None:
         """
@@ -241,41 +292,24 @@ class ReputationManager:
         self.register_client(client_id)
         if round_id in self.client_rounds[client_id]:
             self.reputations[client_id].rounds_dropped += 1
+            self._persist(client_id)
     
     def get_reputation(self, client_id: str) -> Optional[ClientReputation]:
-        """
-        Get reputation for a client.
-        
-        Args:
-            client_id: Identifier of the client
-            
-        Returns:
-            ClientReputation object or None if client not found
-        """
+        if self.repo is not None:
+            self._reload_from_repo()
         return self.reputations.get(client_id)
     
     def get_reputation_score(self, client_id: str) -> float:
-        """
-        Get reputation score for a client (0-1).
-        
-        Args:
-            client_id: Identifier of the client
-            
-        Returns:
-            Reputation score (0.0 if client not found)
-        """
+        if self.repo is not None:
+            self._reload_from_repo()
         rep = self.reputations.get(client_id)
         if rep:
             return rep.reputation_score
         return 0.0
     
     def get_all_reputations(self) -> Dict[str, Dict]:
-        """
-        Get all client reputations.
-        
-        Returns:
-            Dictionary mapping client_id to reputation data
-        """
+        if self.repo is not None:
+            self._reload_from_repo()
         return {
             client_id: rep.to_dict()
             for client_id, rep in self.reputations.items()

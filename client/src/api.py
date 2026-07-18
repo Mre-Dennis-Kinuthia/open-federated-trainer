@@ -99,30 +99,49 @@ def _make_request(
     raise CoordinatorConnectionError(f"Request failed: {last_exception}")
 
 
-def register_client(client_name: str) -> tuple[str, str]:
+def _auth_headers(api_key: Optional[str] = None) -> Dict[str, str]:
+    """Preferred Protocol V2 credential headers (query/body remain as server adapters)."""
+    key = api_key if api_key is not None else get_api_key()
+    headers = {"X-Protocol-Version": "2.0"}
+    if key:
+        headers["X-Api-Key"] = key
+    return headers
+
+
+def register_client(
+    client_name: str,
+    api_key: Optional[str] = None,
+) -> tuple[str, str]:
     """
     Register a client with the coordinator and receive an API key.
-    
+
+    When re-registering an existing name, pass the saved ``api_key`` as proof
+    of possession; otherwise the coordinator returns HTTP 409.
+
     Args:
         client_name: Name/identifier for the client
-        
+        api_key: Optional existing key for idempotent resume
+
     Returns:
         Tuple of (client_id, api_key)
-        
+
     Raises:
         CoordinatorAPIError: If registration fails
         CoordinatorConnectionError: If connection fails
     """
     url = f"{config.COORDINATOR_URL}/client/register"
-    payload = {"client_name": client_name}
-    
-    response = _make_request("POST", url, json=payload)
+    payload: Dict[str, Any] = {"client_name": client_name}
+    key = api_key if api_key is not None else get_api_key()
+    if key:
+        payload["api_key"] = key
+
+    response = _make_request("POST", url, json=payload, headers=_auth_headers(key))
     data = response.json()
-    
+
     if data.get("success"):
         client_id = data.get("client_id", client_name)
-        api_key = data.get("api_key", "")
-        return client_id, api_key
+        returned_key = data.get("api_key", "")
+        return client_id, returned_key
     else:
         raise CoordinatorAPIError(f"Registration failed: {data.get('message', 'Unknown error')}")
 
@@ -146,11 +165,7 @@ def fetch_task(client_id: str, api_key: Optional[str] = None) -> Dict[str, Any]:
         api_key = get_api_key()
     
     url = f"{config.COORDINATOR_URL}/task/{client_id}"
-    params = {}
-    if api_key:
-        params["api_key"] = api_key
-    
-    response = _make_request("GET", url, params=params)
+    response = _make_request("GET", url, headers=_auth_headers(api_key))
     return response.json()
 
 
@@ -198,10 +213,8 @@ def submit_update(
         "round_id": round_id,
         "weight_delta": weight_delta
     }
-    if api_key:
-        payload["api_key"] = api_key
-    
-    response = _make_request("POST", url, json=payload)
+    # Body api_key kept as legacy adapter; header is preferred.
+    response = _make_request("POST", url, json=payload, headers=_auth_headers(api_key))
     data = response.json()
     
     if data.get("success"):
@@ -287,9 +300,31 @@ def claim_job(
         params["api_key"] = api_key
     if types:
         params["types"] = types
-    response = _make_request("GET", url, params=params)
+    response = _make_request("GET", url, headers=_auth_headers(api_key), params=params)
     data = response.json()
     return data.get("job")
+
+
+def extend_job_lease(
+    job_id: str,
+    client_id: str,
+    api_key: Optional[str] = None,
+    extend_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Heartbeat: extend lease for a claimed job."""
+    if api_key is None:
+        api_key = get_api_key()
+    url = f"{config.COORDINATOR_URL}/jobs/{job_id}/lease"
+    params: Dict[str, Any] = {"client_id": client_id}
+    if extend_seconds is not None:
+        params["extend_seconds"] = extend_seconds
+    response = _make_request(
+        "POST",
+        url,
+        headers=_auth_headers(api_key),
+        params=params,
+    )
+    return response.json()
 
 
 def submit_job_result(
@@ -310,8 +345,8 @@ def submit_job_result(
         "success": success,
         "error": error,
     }
-    if api_key:
-        payload["api_key"] = api_key
-    response = _make_request("POST", url, json=payload)
+    response = _make_request(
+        "POST", url, json=payload, headers=_auth_headers(api_key)
+    )
     return response.json()
 

@@ -1,17 +1,20 @@
 """
 Aggregator Module
 
-Collects client updates and performs federated averaging (FedAvg) over
-parsed weight deltas. Pending updates are checkpointed for restart recovery.
+Collects client updates and runs a pluggable aggregation strategy (default FedAvg).
+Pending updates are checkpointed for restart recovery. Aggregate is idempotent:
+re-invoking a CLOSED round returns the previously published model.
 """
 
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from aggregation.strategies import ClientContribution, get_strategy
 from .round_manager import RoundManager, RoundState
 from .model_store import ModelStore
 from .versioning import next_version
@@ -51,30 +54,14 @@ def fedavg_weight_deltas(deltas: List[List[List[float]]]) -> List[List[float]]:
     """
     Federated averaging over a list of per-client weight deltas.
 
-    Each client delta is a list of flattened parameter layers.
+    Kept as a stable helper for tests and callers; delegates to FedAvgStrategy.
     """
-    if not deltas:
-        return []
+    from aggregation.strategies import FedAvgStrategy
 
-    num_clients = len(deltas)
-    num_layers = len(deltas[0])
-    for d in deltas:
-        if len(d) != num_layers:
-            raise ValueError("Inconsistent number of parameter layers across clients")
-
-    averaged: List[List[float]] = []
-    for layer_idx in range(num_layers):
-        layer_len = len(deltas[0][layer_idx])
-        for d in deltas:
-            if len(d[layer_idx]) != layer_len:
-                raise ValueError(f"Inconsistent layer {layer_idx} sizes across clients")
-        avg_layer = [0.0] * layer_len
-        for client_delta in deltas:
-            for i, v in enumerate(client_delta[layer_idx]):
-                avg_layer[i] += float(v)
-        avg_layer = [v / num_clients for v in avg_layer]
-        averaged.append(avg_layer)
-    return averaged
+    contributions = [
+        ClientContribution(client_id=str(i), weight_delta=d) for i, d in enumerate(deltas)
+    ]
+    return FedAvgStrategy().aggregate(contributions).averaged_delta
 
 
 def apply_weight_delta(
@@ -99,7 +86,7 @@ def apply_weight_delta(
 
 
 class Aggregator:
-    """Aggregates client updates with FedAvg and optional persistence."""
+    """Aggregates client updates with a selectable strategy and durable pending state."""
 
     def __init__(
         self,
@@ -110,6 +97,8 @@ class Aggregator:
         rate_limiter=None,
         state_store=None,
         on_aggregated=None,
+        strategy=None,
+        strategy_name: Optional[str] = None,
     ):
         self.round_manager = round_manager
         self.model_store = model_store or ModelStore()
@@ -118,7 +107,9 @@ class Aggregator:
         self.rate_limiter = rate_limiter
         self.state_store = state_store
         self.on_aggregated = on_aggregated
+        self.strategy = strategy or get_strategy(strategy_name)
         self.updates: Dict[int, List[ClientUpdate]] = {}
+        self._aggregate_lock = threading.Lock()
         self._restore_pending()
 
     def _restore_pending(self) -> None:
@@ -194,7 +185,62 @@ class Aggregator:
         self._persist_pending()
         return True
 
+    def _already_closed_result(self, round_id: int, round_obj) -> Dict[str, Any]:
+        published = (round_obj.metadata or {}).get("published_version")
+        model = None
+        if published:
+            try:
+                model = self.model_store.load_model(published)
+            except (FileNotFoundError, ValueError, OSError):
+                model = None
+        return {
+            "round_id": round_id,
+            "model_version": published,
+            "status": "already_closed",
+            "aggregated_model": model,
+            "num_updates": len(round_obj.updates_received),
+            "replayed": True,
+        }
+
+    def reconcile_after_restart(self) -> List[Dict[str, Any]]:
+        """
+        Finish rounds left mid-flight after a coordinator restart.
+
+        Rounds marked ``resume_after_crash`` (was AGGREGATING) or COLLECTING with
+        pending updates that look complete are re-aggregated once.
+        """
+        results: List[Dict[str, Any]] = []
+        for round_id, round_obj in list(self.round_manager.rounds.items()):
+            if round_obj.state == RoundState.CLOSED:
+                continue
+            meta = round_obj.metadata or {}
+            pending = self.updates.get(round_id) or []
+            should = bool(meta.get("resume_after_crash")) or (
+                round_obj.state == RoundState.COLLECTING
+                and pending
+                and len(round_obj.updates_received) >= len(round_obj.assigned_clients)
+                and len(round_obj.assigned_clients) > 0
+            )
+            if not should:
+                continue
+            logger.info(
+                f"Reconciling round {round_id} after restart",
+                extra={
+                    "component": "coordinator",
+                    "event": "round_reconcile",
+                    "round_id": round_id,
+                },
+            )
+            result = self.aggregate(round_id)
+            if result:
+                results.append(result)
+        return results
+
     def aggregate(self, round_id: int) -> Optional[Dict[str, Any]]:
+        with self._aggregate_lock:
+            return self._aggregate_unlocked(round_id)
+
+    def _aggregate_unlocked(self, round_id: int) -> Optional[Dict[str, Any]]:
         round_status = self.round_manager.get_round_status(round_id)
         if round_status is None:
             return None
@@ -204,14 +250,38 @@ class Aggregator:
             return None
 
         if round_obj.state == RoundState.CLOSED:
+            return self._already_closed_result(round_id, round_obj)
+
+        # Idempotency: published version already recorded but state not closed yet
+        published = (round_obj.metadata or {}).get("published_version")
+        if published and self.model_store.model_exists(published):
+            round_obj.metadata["resume_after_crash"] = False
+            self.round_manager.set_round_state(round_id, RoundState.CLOSED)
+            self.updates.pop(round_id, None)
+            self._persist_pending()
+            return self._already_closed_result(round_id, round_obj)
+
+        if not self.round_manager.try_begin_aggregating(round_id):
+            self.round_manager.refresh_round(round_id)
+            round_obj = self.round_manager.rounds.get(round_id)
+            if round_obj is None:
+                return None
+            if round_obj.state == RoundState.CLOSED:
+                return self._already_closed_result(round_id, round_obj)
+            published2 = (round_obj.metadata or {}).get("published_version")
+            if published2 and self.model_store.model_exists(published2):
+                return self._already_closed_result(round_id, round_obj)
             return {
                 "round_id": round_id,
-                "status": "already_closed",
+                "status": "aggregating",
                 "aggregated_model": None,
-                "num_updates": 0,
+                "num_updates": len(round_obj.updates_received),
+                "model_version": round_obj.model_version,
             }
 
-        self.round_manager.set_round_state(round_id, RoundState.AGGREGATING)
+        round_obj = self.round_manager.rounds.get(round_id)
+        if round_obj is None:
+            return None
 
         logger.info(
             f"Aggregation started for round {round_id}",
@@ -220,6 +290,7 @@ class Aggregator:
                 "event": "aggregation_started",
                 "round_id": round_id,
                 "model_version": round_obj.model_version,
+                "strategy": getattr(self.strategy, "name", "unknown"),
             },
         )
 
@@ -236,7 +307,7 @@ class Aggregator:
                 "num_updates": 0,
             }
 
-        parsed: List[List[List[float]]] = []
+        contributions: List[ClientContribution] = []
         base_models: List[List[List[float]]] = []
         model_ids: List[str] = []
         model_configs: List[Dict[str, Any]] = []
@@ -261,7 +332,18 @@ class Aggregator:
                 ):
                     raise ValueError("Update is missing base_weights")
                 apply_weight_delta(base_weights, delta)  # shape validation
-                parsed.append(delta)
+                num_samples = payload.get("num_samples", 1)
+                try:
+                    num_samples_f = float(num_samples)
+                except (TypeError, ValueError):
+                    num_samples_f = 1.0
+                contributions.append(
+                    ClientContribution(
+                        client_id=update.client_id,
+                        weight_delta=delta,
+                        num_samples=num_samples_f,
+                    )
+                )
                 base_models.append(base_weights)
                 model_ids.append(str(payload.get("model_id", "simple_mlp")))
                 model_configs.append(payload.get("model_config") or {})
@@ -276,7 +358,7 @@ class Aggregator:
                     f"Skipping invalid update from {update.client_id}: {exc}"
                 )
 
-        if not parsed:
+        if not contributions:
             self.round_manager.set_round_state(round_id, RoundState.CLOSED)
             return {
                 "round_id": round_id,
@@ -312,20 +394,29 @@ class Aggregator:
             return None
 
         try:
-            averaged_delta = fedavg_weight_deltas(parsed)
+            strategy_result = self.strategy.aggregate(contributions)
+            averaged_delta = strategy_result.averaged_delta
             global_weights = apply_weight_delta(base_models[0], averaged_delta)
         except ValueError as e:
-            logger.error(f"FedAvg failed for round {round_id}: {e}")
+            logger.error(f"Strategy {self.strategy.name} failed for round {round_id}: {e}")
             self.round_manager.set_round_state(round_id, RoundState.COLLECTING)
             return None
 
+        # Stable version: prefer metadata reservation if set mid-flight
+        reserved = (round_obj.metadata or {}).get("reserved_version")
         round_model_version = round_obj.model_version
-        if self.model_store.model_exists(round_model_version):
+        if reserved:
+            new_model_version = reserved
+        elif self.model_store.model_exists(round_model_version):
             latest_global = self.model_store.latest_model_version()
             new_model_version = next_version(latest_global or round_model_version)
         else:
-            # The first version for an architecture is reserved by TaskAssigner.
             new_model_version = round_model_version
+
+        # Reserve version before write so a crash+retry does not mint a new one
+        round_obj.metadata["reserved_version"] = new_model_version
+        round_obj.metadata["aggregation_strategy"] = strategy_result.strategy_name
+        self.round_manager._persist_round(round_obj)
 
         aggregated_model_data = {
             "version": new_model_version,
@@ -338,9 +429,10 @@ class Aggregator:
             "model_config": model_configs[0],
             "weights": global_weights,
             "round_id": round_id,
-            "aggregation": "fedavg",
+            "aggregation": strategy_result.strategy_name,
+            "aggregation_details": strategy_result.details,
             "averaged_weight_delta": averaged_delta,
-            "num_updates": len(parsed),
+            "num_updates": len(contributions),
             "client_ids": valid_clients,
             "mean_final_loss": (sum(losses) / len(losses)) if losses else None,
             "aggregation_timestamp": time.time(),
@@ -352,13 +444,16 @@ class Aggregator:
                 self.task_assigner.set_model_version(new_model_version)
         except Exception as e:
             logger.error(f"Failed to persist model {new_model_version}: {e}")
+            self.round_manager.set_round_state(round_id, RoundState.COLLECTING)
+            return None
 
+        round_obj.metadata["published_version"] = new_model_version
+        round_obj.metadata.pop("resume_after_crash", None)
         self.round_manager.set_round_state(round_id, RoundState.CLOSED)
 
         if self.rate_limiter:
             self.rate_limiter.reset_round(round_id)
 
-        # Drop closed round updates from pending checkpoint
         self.updates.pop(round_id, None)
         self._persist_pending()
 
@@ -369,7 +464,8 @@ class Aggregator:
                 "event": "aggregation_completed",
                 "round_id": round_id,
                 "model_version": new_model_version,
-                "num_updates": len(parsed),
+                "num_updates": len(contributions),
+                "strategy": strategy_result.strategy_name,
             },
         )
 
@@ -388,7 +484,9 @@ class Aggregator:
             "model_version": new_model_version,
             "status": "aggregated",
             "aggregated_model": aggregated_model_data,
-            "num_updates": len(parsed),
+            "num_updates": len(contributions),
+            "replayed": False,
+            "strategy": strategy_result.strategy_name,
         }
 
     def get_updates_for_round(self, round_id: int) -> List[ClientUpdate]:

@@ -46,9 +46,44 @@ export type LoraRound = {
   submitters: string[];
 };
 
+export type Job = {
+  job_id: string;
+  job_type: string;
+  state: string;
+  payload?: Record<string, unknown>;
+  result?: Record<string, unknown>;
+  assigned_client?: string | null;
+  error?: string | null;
+  created_at?: number;
+  attempts?: number;
+};
+
+export type Process = {
+  id: string;
+  kind: string;
+  name: string;
+  pid: number;
+  running: boolean;
+  exit_code?: number | null;
+  env_summary?: Record<string, string>;
+  uptime_seconds?: number | null;
+  log_path?: string | null;
+};
+
+export type LauncherStatus = {
+  enabled?: boolean;
+  running?: number;
+  total?: number;
+  by_kind?: { train?: number; worker?: number };
+  processes?: Process[];
+  dataset_presets?: string[];
+};
+
 export type Overview = {
   version: string;
   async_enabled: boolean;
+  operator_auth_required?: boolean;
+  server_time?: number;
   global: {
     total_clients_seen?: number;
     total_failed_updates?: number;
@@ -62,35 +97,15 @@ export type Overview = {
   lora_adapters?: string[];
   lora_rounds: LoraRound[];
   registered_clients: string[];
-  jobs?: Array<{
-    job_id: string;
-    job_type: string;
-    state: string;
-    assigned_client?: string | null;
-    error?: string | null;
-    result?: Record<string, unknown>;
-  }>;
-  job_stats?: { total?: number; counts?: Record<string, number> };
+  jobs?: Job[];
+  job_stats?: {
+    total?: number;
+    completed?: number;
+    counts?: Record<string, number>;
+  };
   classic_models?: Record<string, unknown>;
   active_model?: { model_id?: string; model_config?: Record<string, unknown> };
-  launcher?: {
-    enabled?: boolean;
-    running?: number;
-    total?: number;
-    by_kind?: { train?: number; worker?: number };
-    processes?: Array<{
-      id: string;
-      kind: string;
-      name: string;
-      pid: number;
-      running: boolean;
-      exit_code?: number | null;
-      env_summary?: Record<string, string>;
-      uptime_seconds?: number | null;
-      log_path?: string | null;
-    }>;
-    dataset_presets?: string[];
-  };
+  launcher?: LauncherStatus;
 };
 
 export type CreateLoraPayload = {
@@ -98,55 +113,115 @@ export type CreateLoraPayload = {
   adapter_version?: string;
   lora_r: number;
   lora_alpha: number;
+  lora_dropout?: number;
+  target_modules?: string[];
   max_steps: number;
   learning_rate: number;
   batch_size: number;
+  gradient_accumulation_steps?: number;
+  warmup_steps?: number;
+  max_seq_length?: number;
 };
 
 const API_BASE = import.meta.env.DEV ? "/api" : "";
-const OPERATOR_KEY = (import.meta.env.VITE_OPERATOR_API_KEY as string | undefined)?.trim() || "";
+const OPERATOR_KEY_STORAGE = "fed-compute.operator-key";
+const BUILD_TIME_KEY =
+  (import.meta.env.VITE_OPERATOR_API_KEY as string | undefined)?.trim() || "";
 
-function operatorQuery(): string {
-  return OPERATOR_KEY ? `?operator_key=${encodeURIComponent(OPERATOR_KEY)}` : "";
+export function getOperatorKey(): string {
+  try {
+    const stored = window.sessionStorage.getItem(OPERATOR_KEY_STORAGE);
+    if (stored !== null) return stored;
+  } catch {
+    /* storage unavailable */
+  }
+  return BUILD_TIME_KEY;
+}
+
+export function setOperatorKey(key: string): void {
+  try {
+    if (key) window.sessionStorage.setItem(OPERATOR_KEY_STORAGE, key);
+    else window.sessionStorage.removeItem(OPERATOR_KEY_STORAGE);
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+export class ApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
-    ...init,
-  });
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...((init?.headers as Record<string, string>) ?? {}),
+  };
+  const operatorKey = getOperatorKey();
+  if (operatorKey) headers["X-Operator-Key"] = operatorKey;
+
+  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
   if (!res.ok) {
     let detail = res.statusText;
     try {
       const body = await res.json();
       detail = body.detail ?? JSON.stringify(body);
     } catch {
-      /* ignore */
+      /* body was not JSON */
     }
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    throw new ApiError(
+      res.status,
+      typeof detail === "string" ? detail : JSON.stringify(detail)
+    );
   }
   return res.json() as Promise<T>;
 }
 
-export function fetchOverview(limit = 25): Promise<Overview> {
-  return request<Overview>(`/dashboard/overview?limit=${limit}`);
+export function fetchOverview(
+  limit = 25,
+  signal?: AbortSignal
+): Promise<Overview> {
+  return request<Overview>(`/dashboard/overview?limit=${limit}`, { signal });
+}
+
+export type ActivityNode = {
+  lat: number;
+  lng: number;
+  city?: string | null;
+  country?: string | null;
+  last_seen: number;
+  online: boolean;
+};
+
+export type Activity = {
+  server_time: number;
+  nodes: ActivityNode[];
+  online_count: number;
+};
+
+export function fetchActivity(signal?: AbortSignal): Promise<Activity> {
+  return request<Activity>(`/dashboard/activity`, { signal });
 }
 
 export function aggregateClassicRound(roundId: number): Promise<unknown> {
-  return request(`/aggregate/${roundId}${operatorQuery()}`);
+  return request(`/aggregate/${roundId}`);
 }
 
 export function createLoraRound(
   payload: CreateLoraPayload
 ): Promise<{ round_id: number; state: string }> {
-  return request(`/rounds/create${operatorQuery()}`, {
+  return request(`/rounds/create`, {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export function aggregateLoraRound(roundId: number): Promise<unknown> {
-  return request(`/rounds/${roundId}/aggregate${operatorQuery()}`, {
+  return request(`/rounds/${roundId}/aggregate`, {
     method: "POST",
     body: JSON.stringify({ round_id: roundId, weight_by_samples: true }),
   });
@@ -156,9 +231,15 @@ export function createJob(
   jobType: string,
   payload: Record<string, unknown>
 ): Promise<unknown> {
-  return request(`/jobs${operatorQuery()}`, {
+  return request(`/jobs`, {
     method: "POST",
     body: JSON.stringify({ job_type: jobType, payload }),
+  });
+}
+
+export function cancelJob(jobId: string): Promise<unknown> {
+  return request(`/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
   });
 }
 
@@ -166,7 +247,7 @@ export function setActiveModel(
   modelId: string,
   modelConfig?: Record<string, unknown>
 ): Promise<unknown> {
-  return request(`/models/active${operatorQuery()}`, {
+  return request(`/models/active`, {
     method: "POST",
     body: JSON.stringify({
       model_id: modelId,
@@ -188,7 +269,7 @@ export type LaunchPayload = {
 };
 
 export function launchProcess(payload: LaunchPayload): Promise<unknown> {
-  return request(`/launch${operatorQuery()}`, {
+  return request(`/launch`, {
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -201,22 +282,17 @@ export function launchDemo(payload: {
   start_worker?: boolean;
   enqueue_sample_job?: boolean;
 }): Promise<unknown> {
-  return request(`/launch/demo${operatorQuery()}`, {
+  return request(`/launch/demo`, {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export function stopLaunch(processId: string): Promise<unknown> {
-  return request(`/launch/${processId}/stop${operatorQuery()}`, {
-    method: "POST",
-  });
+  return request(`/launch/${processId}/stop`, { method: "POST" });
 }
 
 export function stopAllLaunch(kind?: string): Promise<unknown> {
-  const params = new URLSearchParams();
-  if (OPERATOR_KEY) params.set("operator_key", OPERATOR_KEY);
-  if (kind) params.set("kind", kind);
-  const q = params.toString() ? `?${params.toString()}` : "";
+  const q = kind ? `?kind=${encodeURIComponent(kind)}` : "";
   return request(`/launch/stop-all${q}`, { method: "POST" });
 }

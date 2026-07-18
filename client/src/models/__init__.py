@@ -62,6 +62,8 @@ def get_trainer(model_id: Optional[str] = None) -> Trainer:
       2. Env MODEL_ID
       3. Env MODEL_MODULE (import path to Trainer subclass)
       4. simple_mlp default
+
+    Custom / module-path requests hard-fail on import errors (no silent MLP).
     """
     mid = (model_id or os.getenv("MODEL_ID") or "simple_mlp").strip()
 
@@ -72,14 +74,15 @@ def get_trainer(model_id: Optional[str] = None) -> Trainer:
     module_spec = os.getenv("MODEL_MODULE", "").strip()
     if mid == "custom" or module_spec:
         spec = module_spec or mid
+        if mid == "custom" and not module_spec:
+            raise KeyError(
+                "MODEL_ID=custom requires MODEL_MODULE=package.module:ClassName"
+            )
         return _load_external_trainer(spec)
 
-    # Fallback: treat model_id as module:Class
-    if ":" in mid or "." in mid:
-        try:
-            return _load_external_trainer(mid)
-        except Exception:
-            pass
+    # Treat model_id as module:Class — failures are not swallowed
+    if ":" in mid or ("." in mid and mid not in {"simple_mlp", "tiny_cnn"}):
+        return _load_external_trainer(mid)
 
     if "simple_mlp" in _REGISTRY:
         return _REGISTRY["simple_mlp"]()

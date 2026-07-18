@@ -1,0 +1,16 @@
+---
+description: Security and privacy requirements
+globs: "**/*.{py,ts,tsx}"
+alwaysApply: false
+---
+
+# Security & privacy
+
+- Validate all network inputs; enforce size limits.
+- No unsafe deserialization (pickle) for untrusted artifacts.
+- Never log secrets, API keys, bearer tokens, full prompts, or tensors.
+- Registration: do not return existing client keys without proof of possession.
+- Unset `OPERATOR_API_KEY` is unsafe for production.
+- Qualify privacy: data locality ≠ DP ≠ SecAgg ≠ TLS.
+- Inference with `payload.inputs` leaves the node — disclose in UI/docs.
+- Location: coarse + jitter only; no IPs/client ids on public APIs.

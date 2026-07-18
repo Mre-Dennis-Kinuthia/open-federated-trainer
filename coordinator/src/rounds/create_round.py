@@ -6,6 +6,7 @@ Creates a new federated learning round for LoRA fine-tuning.
 
 import json
 import os
+import threading
 from typing import Dict, Optional
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -31,10 +32,14 @@ class LoRARoundConfig:
     gradient_accumulation_steps: int = 4  # Gradient accumulation
     warmup_steps: int = 10  # Warmup steps
     max_seq_length: int = 512  # Maximum sequence length
+    task_type: str = "causal_lm"  # causal_lm | seq_cls
+    published_version: Optional[str] = None
+    aggregation_strategy: Optional[str] = None
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
-    state: str = "OPEN"  # OPEN, COLLECTING, AGGREGATING, CLOSED
+    # OPEN → COLLECTING → AGGREGATING → EVALUATING → CLOSED | REJECTED
+    state: str = "OPEN"
 
 
 class LoRARoundManager:
@@ -54,6 +59,7 @@ class LoRARoundManager:
             state_path or os.getenv("LORA_STATE_PATH", str(default_path))
         )
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._load()
 
     def _load(self) -> None:
@@ -76,24 +82,25 @@ class LoRARoundManager:
             ) from exc
 
     def _persist(self) -> None:
-        payload = {
-            "version": 1,
-            "next_round_id": self.next_round_id,
-            "rounds": {
-                str(round_id): asdict(config)
-                for round_id, config in self.rounds.items()
-            },
-            "adapter_submissions": {
-                str(round_id): submissions
-                for round_id, submissions in self.adapter_submissions.items()
-            },
-        }
-        temporary = self.state_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(payload, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        os.replace(temporary, self.state_path)
+        with self._lock:
+            payload = {
+                "version": 1,
+                "next_round_id": self.next_round_id,
+                "rounds": {
+                    str(round_id): asdict(config)
+                    for round_id, config in self.rounds.items()
+                },
+                "adapter_submissions": {
+                    str(round_id): submissions
+                    for round_id, submissions in self.adapter_submissions.items()
+                },
+            }
+            temporary = self.state_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(payload, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.state_path)
     
     def create_round(
         self,
@@ -108,7 +115,8 @@ class LoRARoundManager:
         batch_size: int = 4,
         gradient_accumulation_steps: int = 4,
         warmup_steps: int = 10,
-        max_seq_length: int = 512
+        max_seq_length: int = 512,
+        task_type: str = "causal_lm",
     ) -> LoRARoundConfig:
         """
         Create a new LoRA fine-tuning round.
@@ -126,6 +134,7 @@ class LoRARoundManager:
             gradient_accumulation_steps: Gradient accumulation steps
             warmup_steps: Number of warmup steps
             max_seq_length: Maximum sequence length
+            task_type: Evaluation/task family (causal_lm or seq_cls)
             
         Returns:
             LoRARoundConfig for the created round
@@ -149,7 +158,8 @@ class LoRARoundManager:
             batch_size=batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=warmup_steps,
-            max_seq_length=max_seq_length
+            max_seq_length=max_seq_length,
+            task_type=task_type or "causal_lm",
         )
         
         self.rounds[round_id] = config
@@ -306,7 +316,14 @@ class LoRARoundManager:
     def set_state(self, round_id: int, state: str) -> bool:
         if round_id not in self.rounds:
             return False
-        if state not in {"OPEN", "COLLECTING", "AGGREGATING", "CLOSED"}:
+        if state not in {
+            "OPEN",
+            "COLLECTING",
+            "AGGREGATING",
+            "EVALUATING",
+            "CLOSED",
+            "REJECTED",
+        }:
             raise ValueError(f"Invalid LoRA round state: {state}")
         self.rounds[round_id].state = state
         self._persist()

@@ -24,7 +24,7 @@ class StateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._data: Dict[str, Any] = {
-            "auth": {"client_keys": {}},
+            "auth": {"client_keys": {}, "public_keys": {}},
             "clients": [],
             "pending_updates": {},
             "next_round_id": 1,
@@ -40,8 +40,9 @@ class StateStore:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
                     self._data.update(raw)
-                    self._data.setdefault("auth", {"client_keys": {}})
+                    self._data.setdefault("auth", {"client_keys": {}, "public_keys": {}})
                     self._data["auth"].setdefault("client_keys", {})
+                    self._data["auth"].setdefault("public_keys", {})
                     self._data.setdefault("clients", [])
                     self._data.setdefault("pending_updates", {})
                     self._data.setdefault("next_round_id", 1)
@@ -69,10 +70,21 @@ class StateStore:
             self._data["clients"] = sorted(clients)
             self._save_unlocked()
 
+    def get_public_keys(self) -> Dict[str, str]:
+        with self._lock:
+            return dict(self._data.get("auth", {}).get("public_keys", {}))
+
+    def set_public_key(self, client_id: str, public_key: str) -> None:
+        with self._lock:
+            self._data.setdefault("auth", {}).setdefault("public_keys", {})[client_id] = public_key
+            self._save_unlocked()
+
     def remove_client(self, client_id: str) -> None:
         with self._lock:
             keys = self._data.setdefault("auth", {}).setdefault("client_keys", {})
             keys.pop(client_id, None)
+            pubs = self._data.setdefault("auth", {}).setdefault("public_keys", {})
+            pubs.pop(client_id, None)
             clients = set(self._data.get("clients", []))
             clients.discard(client_id)
             self._data["clients"] = sorted(clients)

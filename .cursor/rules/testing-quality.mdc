@@ -1,0 +1,13 @@
+---
+description: Testing and quality bar
+globs: "tests/**/*"
+alwaysApply: false
+---
+
+# Testing
+
+- Commands: `client/venv/bin/python -m pytest tests/ -q`; `cd ui && npm run build`.
+- Do not weaken tests to pass; do not hide failures.
+- New auth/size/state fixes need negative tests (401/409/413).
+- Prefer regression tests for restart durability and idempotency when touching those paths.
+- Integration shell scripts under `tests/integration/` may be stale — verify `DATASET_PATH` assumptions.

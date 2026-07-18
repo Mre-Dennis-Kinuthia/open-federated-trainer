@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { CreateLoraPayload, LoraRound } from "../api";
+import { StatusBadge, roundStatus } from "./StatusBadge";
 
 type Props = {
   baseModels: string[];
@@ -30,18 +31,53 @@ export function LoraPanel({
     learning_rate: 0.0002,
     batch_size: 4,
   });
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [advanced, setAdvanced] = useState({
+    lora_dropout: 0.1,
+    target_modules: "q_proj,v_proj",
+    gradient_accumulation_steps: 4,
+    warmup_steps: 10,
+    max_seq_length: 512,
+  });
+
+  function set<K extends keyof CreateLoraPayload>(
+    key: K,
+    value: CreateLoraPayload[K]
+  ) {
+    setForm((f) => ({ ...f, [key]: value }));
+  }
 
   return (
     <>
-      <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card spaced">
         <div className="card-hd">
           <h2>Create LoRA round</h2>
         </div>
         <div className="card-bd">
+          <p className="help">
+            Creates a round that LoRA participants can join. Participants run{" "}
+            <code>client/src/lora_client.py</code> with a configured
+            DATASET_PATH; the local launcher does not start LoRA clients.
+          </p>
           <form
             onSubmit={async (e) => {
               e.preventDefault();
-              await onCreate(form);
+              const payload: CreateLoraPayload = {
+                ...form,
+                adapter_version: form.adapter_version || undefined,
+              };
+              if (showAdvanced) {
+                payload.lora_dropout = advanced.lora_dropout;
+                payload.target_modules = advanced.target_modules
+                  .split(",")
+                  .map((m) => m.trim())
+                  .filter(Boolean);
+                payload.gradient_accumulation_steps =
+                  advanced.gradient_accumulation_steps;
+                payload.warmup_steps = advanced.warmup_steps;
+                payload.max_seq_length = advanced.max_seq_length;
+              }
+              await onCreate(payload);
             }}
           >
             <div className="form-grid">
@@ -50,9 +86,7 @@ export function LoraPanel({
                 <select
                   id="base_model_id"
                   value={form.base_model_id}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, base_model_id: e.target.value }))
-                  }
+                  onChange={(e) => set("base_model_id", e.target.value)}
                 >
                   {models.map((m) => (
                     <option key={m} value={m}>
@@ -62,28 +96,11 @@ export function LoraPanel({
                 </select>
               </div>
               <div className="field">
-                <label htmlFor="lora_r">LoRA r</label>
-                <input
-                  id="lora_r"
-                  type="number"
-                  min={1}
-                  value={form.lora_r}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, lora_r: Number(e.target.value) }))
-                  }
-                />
-              </div>
-              <div className="field">
                 <label htmlFor="adapter_version">Continue adapter</label>
                 <select
                   id="adapter_version"
                   value={form.adapter_version ?? ""}
-                  onChange={(e) =>
-                    setForm((f) => ({
-                      ...f,
-                      adapter_version: e.target.value || undefined,
-                    }))
-                  }
+                  onChange={(e) => set("adapter_version", e.target.value)}
                 >
                   <option value="">Start fresh</option>
                   {adapterVersions.map((version) => (
@@ -94,18 +111,23 @@ export function LoraPanel({
                 </select>
               </div>
               <div className="field">
+                <label htmlFor="lora_r">LoRA rank (r)</label>
+                <input
+                  id="lora_r"
+                  type="number"
+                  min={1}
+                  value={form.lora_r}
+                  onChange={(e) => set("lora_r", Number(e.target.value))}
+                />
+              </div>
+              <div className="field">
                 <label htmlFor="lora_alpha">LoRA alpha</label>
                 <input
                   id="lora_alpha"
                   type="number"
                   min={1}
                   value={form.lora_alpha}
-                  onChange={(e) =>
-                    setForm((f) => ({
-                      ...f,
-                      lora_alpha: Number(e.target.value),
-                    }))
-                  }
+                  onChange={(e) => set("lora_alpha", Number(e.target.value))}
                 />
               </div>
               <div className="field">
@@ -115,12 +137,7 @@ export function LoraPanel({
                   type="number"
                   min={1}
                   value={form.max_steps}
-                  onChange={(e) =>
-                    setForm((f) => ({
-                      ...f,
-                      max_steps: Number(e.target.value),
-                    }))
-                  }
+                  onChange={(e) => set("max_steps", Number(e.target.value))}
                 />
               </div>
               <div className="field">
@@ -131,12 +148,7 @@ export function LoraPanel({
                   step="0.0001"
                   min={0}
                   value={form.learning_rate}
-                  onChange={(e) =>
-                    setForm((f) => ({
-                      ...f,
-                      learning_rate: Number(e.target.value),
-                    }))
-                  }
+                  onChange={(e) => set("learning_rate", Number(e.target.value))}
                 />
               </div>
               <div className="field">
@@ -146,64 +158,170 @@ export function LoraPanel({
                   type="number"
                   min={1}
                   value={form.batch_size}
-                  onChange={(e) =>
-                    setForm((f) => ({
-                      ...f,
-                      batch_size: Number(e.target.value),
-                    }))
-                  }
+                  onChange={(e) => set("batch_size", Number(e.target.value))}
                 />
               </div>
             </div>
-            <button className="btn primary" type="submit" disabled={creating}>
-              {creating ? "Creating…" : "Create round"}
+
+            <button
+              type="button"
+              className="btn ghost"
+              aria-expanded={showAdvanced}
+              onClick={() => setShowAdvanced((v) => !v)}
+            >
+              {showAdvanced ? "Hide advanced options" : "Show advanced options"}
             </button>
+
+            {showAdvanced && (
+              <div className="form-grid" style={{ marginTop: 12 }}>
+                <div className="field">
+                  <label htmlFor="lora_dropout">LoRA dropout</label>
+                  <input
+                    id="lora_dropout"
+                    type="number"
+                    step="0.01"
+                    min={0}
+                    max={1}
+                    value={advanced.lora_dropout}
+                    onChange={(e) =>
+                      setAdvanced((a) => ({
+                        ...a,
+                        lora_dropout: Number(e.target.value),
+                      }))
+                    }
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="target_modules">
+                    Target modules, comma-separated
+                  </label>
+                  <input
+                    id="target_modules"
+                    value={advanced.target_modules}
+                    onChange={(e) =>
+                      setAdvanced((a) => ({
+                        ...a,
+                        target_modules: e.target.value,
+                      }))
+                    }
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="grad_accum">Gradient accumulation steps</label>
+                  <input
+                    id="grad_accum"
+                    type="number"
+                    min={1}
+                    value={advanced.gradient_accumulation_steps}
+                    onChange={(e) =>
+                      setAdvanced((a) => ({
+                        ...a,
+                        gradient_accumulation_steps: Number(e.target.value),
+                      }))
+                    }
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="warmup_steps">Warmup steps</label>
+                  <input
+                    id="warmup_steps"
+                    type="number"
+                    min={0}
+                    value={advanced.warmup_steps}
+                    onChange={(e) =>
+                      setAdvanced((a) => ({
+                        ...a,
+                        warmup_steps: Number(e.target.value),
+                      }))
+                    }
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="max_seq_length">Max sequence length</label>
+                  <input
+                    id="max_seq_length"
+                    type="number"
+                    min={16}
+                    value={advanced.max_seq_length}
+                    onChange={(e) =>
+                      setAdvanced((a) => ({
+                        ...a,
+                        max_seq_length: Number(e.target.value),
+                      }))
+                    }
+                  />
+                </div>
+              </div>
+            )}
+
+            <div className="row-actions">
+              <button className="btn primary" type="submit" disabled={creating}>
+                {creating ? "Creating…" : "Create round"}
+              </button>
+            </div>
           </form>
         </div>
       </div>
 
-      <div className="list">
-        {rounds.length === 0 ? (
+      {rounds.length === 0 ? (
+        <div className="list">
           <div className="empty">There are no LoRA rounds yet.</div>
-        ) : (
-          rounds.map((r, idx) => (
-            <div className="list-row" key={r.round_id}>
-              <div>
-                <div className="title">
-                  LoRA #{r.round_id} · {r.base_model_id}
-                </div>
-                <div className="meta">
-                  r={r.lora_r} α={r.lora_alpha} · {r.submission_count} adapters
-                </div>
-              </div>
-              <div className={`status ${r.state.toLowerCase()}`}>
-                <span className="sdot" />
-                {r.state}
-              </div>
-              <div>
-                <span className={`badge ${idx === 0 ? "primary" : "outline"}`}>
-                  LoRA
-                </span>
-              </div>
-              <div className="mono">{r.max_steps} steps</div>
-              <div className="mono">{r.submission_count} up</div>
-              <div>
-                <button
-                  className="btn"
-                  disabled={
-                    r.state === "CLOSED" ||
-                    r.submission_count === 0 ||
-                    busyId === r.round_id
-                  }
-                  onClick={() => onAggregate(r.round_id)}
-                >
-                  {busyId === r.round_id ? "…" : "Aggregate"}
-                </button>
-              </div>
-            </div>
-          ))
-        )}
-      </div>
+        </div>
+      ) : (
+        <div className="table-wrap">
+          <table className="table">
+            <caption className="sr-only">
+              LoRA fine-tuning rounds with configuration and submissions
+            </caption>
+            <thead>
+              <tr>
+                <th scope="col">Round</th>
+                <th scope="col">State</th>
+                <th scope="col">Base model</th>
+                <th scope="col">Config</th>
+                <th scope="col">Adapters</th>
+                <th scope="col">
+                  <span className="sr-only">Actions</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {rounds.map((r) => {
+                const status = roundStatus(r.state);
+                return (
+                  <tr key={r.round_id}>
+                    <td>
+                      <span className="title">#{r.round_id}</span>
+                    </td>
+                    <td>
+                      <StatusBadge kind={status.kind} label={status.label} />
+                    </td>
+                    <td>{r.base_model_id}</td>
+                    <td className="mono">
+                      r={r.lora_r} α={r.lora_alpha} · {r.max_steps} steps
+                    </td>
+                    <td className="mono">{r.submission_count}</td>
+                    <td className="cell-actions">
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={
+                          r.state === "CLOSED" ||
+                          r.submission_count === 0 ||
+                          busyId === r.round_id
+                        }
+                        onClick={() => onAggregate(r.round_id)}
+                      >
+                        {busyId === r.round_id ? "Aggregating…" : "Aggregate"}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </>
   );
 }

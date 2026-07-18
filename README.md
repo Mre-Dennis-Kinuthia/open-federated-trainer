@@ -25,7 +25,13 @@
 
 ## Overview
 
-Open Federated Trainer is a production-ready federated learning system that enables distributed machine learning across volunteer and edge computing resources. Inspired by volunteer computing projects like SETI@home and Folding@home, this platform allows multiple clients to collaboratively train machine learning models without sharing raw data.
+Open Federated Trainer is a **functional open-source prototype** evolving toward
+a production federated-compute platform. Raw training data stays on clients for
+classic FL/LoRA; see `PRODUCTION.md` and `docs/audit/` for what is still unsafe
+for multi-tenant production (auth gaps being hardened, durable rounds, TLS, DP).
+
+For architecture and roadmap: `AGENTS.md`, `docs/architecture/TARGET_ARCHITECTURE.md`,
+`docs/roadmap/IMPLEMENTATION_PLAN.md`.
 
 ### What is Federated Learning?
 

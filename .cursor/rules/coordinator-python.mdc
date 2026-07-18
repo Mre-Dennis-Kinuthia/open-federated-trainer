@@ -1,0 +1,15 @@
+---
+description: Coordinator Python conventions
+globs: coordinator/**/*.py
+alwaysApply: false
+---
+
+# Coordinator Python
+
+- FastAPI routes in `coordinator/src/main.py`; classify public / node / operator.
+- Operator mutations: `_require_operator` + `X-Operator-Key`.
+- Size-limit large JSON with `_require_json_size` before persisting.
+- Persist with atomic tmp+replace and locks where concurrent (see `StateStore`, `JobQueue`).
+- Do not `importlib` / `eval` / `exec` network-supplied code on the coordinator.
+- Local launcher (`ENABLE_LOCAL_LAUNCHER`) is single-tenant ops only; keep default off in library code.
+- Prefer typed Pydantic models; avoid unstructured dicts for new APIs.

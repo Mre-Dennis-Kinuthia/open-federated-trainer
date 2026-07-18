@@ -1,0 +1,14 @@
+---
+description: Client and worker runtime rules
+globs: client/**/*.py
+alwaysApply: false
+---
+
+# Client runtime
+
+- Hard-fail missing `DATASET_PATH` unless `ALLOW_SYNTHETIC_DATA=true` (explicit opt-in only).
+- Loaders live in `client/src/private_datasets/` (not empty `datasets/`).
+- `MODEL_MODULE` dynamic import: hard-fail on error; never silently fall back to `simple_mlp` when custom was requested.
+- Compute: only entrypoints allowed by `COMPUTE_PLUGIN_ALLOWLIST`.
+- Prefer API keys in headers when adding new calls; avoid new query-string secrets.
+- Do not send raw private dataset paths to public UI APIs.

@@ -13,14 +13,18 @@ services:
       - ./coordinator/metrics:/app/metrics
       - ./coordinator/logs:/app/logs
       - ./coordinator/data:/app/data
+      - ./coordinator/artifacts:/app/artifacts
       - ./adapters:/app/adapters
     environment:
       - PYTHONUNBUFFERED=1
       - ENABLE_ASYNC_ROUNDS=true
       - ASYNC_MIN_UPDATES=2
       - ASYNC_MAX_DURATION=300
-      - OPERATOR_API_KEY=${OPERATOR_API_KEY:-}
+      - OPERATOR_API_KEY=${OPERATOR_API_KEY:-dev-operator-change-me}
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      - METADATA_BACKEND=${METADATA_BACKEND:-json}
+      - DATABASE_URL=${DATABASE_URL:-}
+      - ARTIFACT_STORE=${ARTIFACT_STORE:-local}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import http.client; conn = http.client.HTTPConnection('localhost', 8000); conn.request('GET', '/health'); r = conn.getresponse(); exit(0 if r.status == 200 else 1)"]
@@ -39,6 +43,7 @@ services:
       - COORDINATOR_URL=http://coordinator:8000
       - CLIENT_NAME=${CLIENT_NAME:-}
       - CLIENT_API_KEY=${CLIENT_API_KEY:-}
+      - DATASET_PATH=${DATASET_PATH:-}
       - MAX_RETRIES=3
       - SLEEP_BETWEEN_ROUNDS=5.0
       - RETRY_DELAY=2.0
@@ -53,9 +58,46 @@ services:
       - federated-network
     restart: unless-stopped
 
+  # Optional durable stack: docker compose --profile durable up -d
+  postgres:
+    profiles: ["durable"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fedcompute
+      POSTGRES_PASSWORD: fedcompute
+      POSTGRES_DB: fedcompute
+    ports:
+      - "5432:5432"
+    volumes:
+      - fedcompute-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fedcompute -d fedcompute"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - federated-network
+
+  minio:
+    profiles: ["durable"]
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: fedcompute
+      MINIO_ROOT_PASSWORD: fedcompute-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - fedcompute-minio:/data
+    networks:
+      - federated-network
+
 networks:
   federated-network:
     driver: bridge
 
 volumes:
   client-keys:
+  fedcompute-pg:
+  fedcompute-minio:

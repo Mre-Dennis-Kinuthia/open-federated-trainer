@@ -1,0 +1,69 @@
+replicaCount: 2
+
+image:
+  repository: fed-compute/coordinator
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8000
+
+ingress:
+  enabled: false
+  className: ""
+  annotations:
+    # cert-manager example (enable with real issuer):
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: fedcompute.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: fed-compute-tls
+      hosts:
+        - fedcompute.local
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+# Shared config (non-secret)
+env:
+  METADATA_BACKEND: postgres
+  ARTIFACT_STORE: s3
+  S3_BUCKET: fedcompute-artifacts
+  S3_PREFIX: artifacts
+  S3_REGION: us-east-1
+  REQUIRE_OPERATOR_KEY: "true"
+  ENABLE_ASYNC_ROUNDS: "true"
+  CORS_ORIGINS: "*"
+
+# Secrets via existing Secret or chart-generated
+secrets:
+  create: true
+  OPERATOR_API_KEY: "change-me"
+  DATABASE_URL: "postgresql+psycopg2://fedcompute:fedcompute@postgres:5432/fedcompute"
+  S3_ENDPOINT_URL: "http://minio:9000"
+  S3_ACCESS_KEY: "fedcompute"
+  S3_SECRET_KEY: "fedcompute-secret"
+
+# External dependency notes (not deployed by this chart by default)
+external:
+  postgres: true
+  objectStore: true
+
+livenessProbe:
+  path: /health
+  initialDelaySeconds: 15
+  periodSeconds: 10
+
+readinessProbe:
+  path: /ready
+  initialDelaySeconds: 10
+  periodSeconds: 5

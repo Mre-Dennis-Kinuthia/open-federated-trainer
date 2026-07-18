@@ -1,0 +1,14 @@
+---
+description: Documentation truthfulness
+globs: "**/*.md"
+alwaysApply: false
+---
+
+# Documentation
+
+- Code is source of truth; update docs with behavior changes.
+- Label Implemented / Experimental / Planned / Unsafe for production.
+- Do not describe roadmap features in present tense.
+- Prefer accurate privacy wording (see `docs/architecture/PRIVACY_MODEL.md`).
+- Point operators to `docs/audit/` and `PRODUCTION.md` for gaps.
+- Env names must match code (`COMPUTE_PLUGIN_ALLOWLIST`, not `COMPUTE_ALLOWLIST`).

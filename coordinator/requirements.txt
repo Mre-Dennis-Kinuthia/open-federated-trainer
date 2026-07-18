@@ -5,4 +5,11 @@ torch>=2.0.0
 transformers>=4.35.0
 peft>=0.7.0
 numpy>=1.24.0
+# Milestone 1 durable metadata (optional at runtime when METADATA_BACKEND=json)
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+cryptography>=42.0.0
+# Milestone 8 production backends (optional when METADATA_BACKEND=json / ARTIFACT_STORE=local)
+boto3>=1.34.0
+psycopg2-binary>=2.9.9
 

@@ -1,0 +1,13 @@
+---
+description: Architectural boundaries for fed-compute
+alwaysApply: true
+---
+
+# Architecture
+
+- Preserve multi-workload federated compute (train, LoRA, jobs) — not “FL library only.”
+- Control plane metadata vs data-plane artifacts; do not add new production paths that ship large tensors as nested JSON.
+- Default `METADATA_BACKEND=json` for local demo; Postgres behind an explicit flag.
+- No authoritative coordination state only in process memory for new features — persist or document as prototype.
+- Feature-flag migrations; never silently discard JSON state.
+- Public landing may call anonymized `/dashboard/activity` only; ops detail requires operator auth.

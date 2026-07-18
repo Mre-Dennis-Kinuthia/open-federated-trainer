@@ -29,6 +29,7 @@ coordinator/logs/
 # Runtime artifacts (local training / rounds)
 coordinator/metrics/
 coordinator/models/
+coordinator/artifacts/
 
 # Environment variables
 .env
@@ -52,4 +53,12 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+
+# Lab TLS material (regenerate with scripts/gen-dev-certs.sh)
+deploy/certs/*.pem
+deploy/certs/*.key
+deploy/certs/*.crt
+
+# Local backups
+backups/
 

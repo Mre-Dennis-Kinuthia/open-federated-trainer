@@ -4,7 +4,7 @@ FastAPI Server for Federated Learning Coordinator
 Main entry point for the coordinator API.
 """
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,12 +13,18 @@ from typing import Optional, Dict, Any, List
 from pathlib import Path
 
 from core.round_manager import RoundManager
+from persistence.json_repos import get_round_repository
 from core.task_assigner import TaskAssigner
 from core.update_validator import UpdateValidator
 from core.aggregator import Aggregator
 from core.model_store import ModelStore
 from core.metrics import MetricsCollector
-from core.auth import AuthManager, validate_operator_key, get_operator_api_key
+from core.auth import (
+    AuthManager,
+    ClientAlreadyRegisteredError,
+    validate_operator_key,
+    get_operator_api_key,
+)
 from core.rate_limiter import RateLimiter
 from core.privacy import PrivacyProtector
 from core.async_round_manager import AsyncRoundManager, AsyncRoundConfig
@@ -27,10 +33,12 @@ from core.incentives import IncentiveManager
 from core.state_store import StateStore
 from jobs import get_job_queue
 from core.local_launcher import get_local_launcher
+from core.geo_presence import get_geo_presence
 from model_registry.base_models import BaseModelRegistry
 from rounds import create_lora_round, get_lora_round, close_lora_round
 from rounds.create_round import get_lora_round_manager
 from aggregation import aggregate_lora_adapters, validate_adapter
+from aggregation.adapter_manifest import build_adapter_manifest, register_adapter_manifest
 from evaluation import evaluate_adapter
 from core.versioning import next_version
 from utils.logger import setup_coordinator_logger
@@ -46,6 +54,13 @@ logger.info("Coordinator starting", extra={
     "component": "coordinator",
     "event": "coordinator_started"
 })
+
+if os.getenv("REQUIRE_OPERATOR_KEY", "").strip().lower() in ("1", "true", "yes"):
+    if get_operator_api_key() is None:
+        raise RuntimeError(
+            "REQUIRE_OPERATOR_KEY is set but OPERATOR_API_KEY is empty. "
+            "Refuse to start an open control plane."
+        )
 
 
 # Initialize FastAPI app
@@ -74,10 +89,42 @@ app.add_middleware(
 # Durable state + core modules
 state_store = StateStore()
 model_store = ModelStore()
-round_manager = RoundManager(state_store=state_store)
+round_manager = RoundManager(
+    state_store=state_store,
+    round_repo=get_round_repository(),
+)
 task_assigner = TaskAssigner(round_manager, model_store)
 auth_manager = AuthManager(state_store=state_store)
-rate_limiter = RateLimiter()
+
+_ha_reputation_repo = None
+_ha_incentive_repo = None
+_ha_geo_repo = None
+_ha_rate_repo = None
+try:
+    from persistence.shared_state import shared_state_enabled
+    from persistence.db import create_all_tables
+
+    if shared_state_enabled():
+        create_all_tables()
+        from persistence.ha_repos import (
+            SqlGeoPresenceRepository,
+            SqlIncentiveRepository,
+            SqlRateLimitRepository,
+            SqlReputationRepository,
+        )
+
+        _ha_reputation_repo = SqlReputationRepository()
+        _ha_incentive_repo = SqlIncentiveRepository()
+        _ha_geo_repo = SqlGeoPresenceRepository()
+        _ha_rate_repo = SqlRateLimitRepository()
+        logger.info(
+            "Shared HA state enabled (SQL reputation/incentives/geo/rate-limits)",
+            extra={"component": "coordinator", "event": "ha_shared_state_on"},
+        )
+except Exception as _ha_exc:  # noqa: BLE001
+    logger.warning("HA shared state init failed: %s", _ha_exc)
+
+rate_limiter = RateLimiter(repo=_ha_rate_repo)
 privacy_protector = PrivacyProtector()
 update_validator = UpdateValidator(
     round_manager,
@@ -140,11 +187,24 @@ aggregator = Aggregator(
     ),
 )
 
-reputation_manager = ReputationManager()
+# Finish rounds interrupted mid-aggregate (Milestone 3)
+_reconcile_results = aggregator.reconcile_after_restart()
+if _reconcile_results:
+    logger.info(
+        f"Reconciled {len(_reconcile_results)} round(s) after restart",
+        extra={
+            "component": "coordinator",
+            "event": "rounds_reconciled",
+            "count": len(_reconcile_results),
+        },
+    )
+
+reputation_manager = ReputationManager(repo=_ha_reputation_repo)
 incentive_manager = IncentiveManager(
     base_reward_per_update=float(os.getenv("INCENTIVE_BASE_REWARD", "10.0")),
     speed_bonus_threshold=float(os.getenv("INCENTIVE_SPEED_THRESHOLD", "30.0")),
-    consistency_bonus_threshold=int(os.getenv("INCENTIVE_CONSISTENCY_THRESHOLD", "5"))
+    consistency_bonus_threshold=int(os.getenv("INCENTIVE_CONSISTENCY_THRESHOLD", "5")),
+    repo=_ha_incentive_repo,
 )
 
 # LoRA modules
@@ -153,6 +213,30 @@ lora_round_manager = get_lora_round_manager()
 adapter_store = ModelStore(models_dir=str(Path(__file__).parent.parent.parent / "adapters"))
 job_queue = get_job_queue()
 local_launcher = get_local_launcher()
+geo_presence = get_geo_presence(repo=_ha_geo_repo)
+
+
+def _client_ip(http_request: Request) -> Optional[str]:
+    forwarded = http_request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return http_request.client.host if http_request.client else None
+
+
+from protocol.routes import bind_dependencies, router as protocol_router
+from protocol.credentials import extract_api_key
+from protocol.version import ProtocolIncompatibleError, negotiate_protocol_version
+
+bind_dependencies(
+    auth_manager=auth_manager,
+    round_manager=round_manager,
+    update_validator=update_validator,
+    metrics_collector=metrics_collector,
+    geo_presence=geo_presence,
+    client_ip_fn=_client_ip,
+    register_legacy_fn=None,
+)
+app.include_router(protocol_router)
 
 # Built-in classic FL architectures advertised to clients/UI
 CLASSIC_MODEL_CATALOG = {
@@ -184,11 +268,22 @@ CLASSIC_MODEL_CATALOG = {
 }
 
 
+def operator_key_value(
+    operator_key: Optional[str] = Query(None),
+    x_operator_key: Optional[str] = Header(None, alias="X-Operator-Key"),
+) -> Optional[str]:
+    """Operator credential from header (preferred) or legacy query param."""
+    return x_operator_key or operator_key
+
+
 def _require_operator(operator_key: Optional[str]) -> None:
     if not validate_operator_key(operator_key):
         raise HTTPException(
             status_code=401,
-            detail="Operator authentication required. Set OPERATOR_API_KEY and pass operator_key.",
+            detail=(
+                "Operator authentication required. Send the X-Operator-Key "
+                "header (or legacy operator_key query parameter)."
+            ),
         )
 
 
@@ -206,6 +301,8 @@ def _require_json_size(value: Any, *, env_name: str, default: int, label: str) -
 class ClientRegisterRequest(BaseModel):
     """Request model for client registration."""
     client_name: str
+    api_key: Optional[str] = None  # proof of possession when re-registering
+    public_key: Optional[str] = None  # optional Ed25519 public key (Protocol V2)
 
 
 class ClientRegisterResponse(BaseModel):
@@ -242,6 +339,8 @@ class CreateJobRequest(BaseModel):
     payload: Optional[Dict[str, Any]] = None
     priority: int = 0
     tags: Optional[list] = None
+    max_attempts: int = 3
+    lease_seconds: Optional[float] = None
 
 
 class LaunchRequest(BaseModel):
@@ -336,6 +435,7 @@ class CreateLoRARoundRequest(BaseModel):
     gradient_accumulation_steps: int = 4
     warmup_steps: int = 10
     max_seq_length: int = 512
+    task_type: str = "causal_lm"
 
 
 class LoRARoundResponse(BaseModel):
@@ -377,6 +477,7 @@ class AggregateRoundRequest(BaseModel):
     """Request model for aggregating a round."""
     round_id: int
     weight_by_samples: bool = True
+    strategy: Optional[str] = None  # delta_svd (default) | param_fedavg
 
 
 class AggregateRoundResponse(BaseModel):
@@ -387,30 +488,54 @@ class AggregateRoundResponse(BaseModel):
     num_adapters: int
     evaluation_passed: bool
     evaluation_loss: Optional[float] = None
+    aggregation_strategy: Optional[str] = None
+    replayed: bool = False
 
 
 @app.post("/client/register", response_model=ClientRegisterResponse)
-async def register_client(request: ClientRegisterRequest) -> ClientRegisterResponse:
+async def register_client(
+    request: ClientRegisterRequest,
+    http_request: Request,
+) -> ClientRegisterResponse:
     """
     Register a client and receive an API key.
 
-    Idempotent for volunteer/edge: returning clients get their existing key.
+    Idempotent only with proof of possession: returning clients must present
+    their existing ``api_key``. Unauthenticated callers never receive an
+    existing key (HTTP 409 if the name is taken).
     """
+    geo_presence.record(request.client_name, _client_ip(http_request))
     logger.info(f"Registration request received for client {request.client_name}", extra={
         "component": "coordinator",
         "event": "registration_request",
         "client_id": request.client_name
     })
 
-    already = request.client_name in round_manager.clients
-    if not already:
+    already = auth_manager.is_registered(request.client_name)
+    try:
+        api_key = auth_manager.register_client(
+            request.client_name,
+            presented_key=request.api_key,
+        )
+    except ClientAlreadyRegisteredError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+
+    if request.client_name not in round_manager.clients:
         round_manager.register_client(request.client_name)
 
-    api_key = auth_manager.register_client(request.client_name)
     metrics_collector.total_clients_seen.add(request.client_name)
 
+    if request.public_key:
+        try:
+            auth_manager.set_public_key(request.client_name, request.public_key)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     message = (
-        f"Client {request.client_name} already registered; returning existing API key."
+        f"Client {request.client_name} resumed with existing API key."
         if already
         else f"Client {request.client_name} registered successfully. Save your API key!"
     )
@@ -431,20 +556,35 @@ async def register_client(request: ClientRegisterRequest) -> ClientRegisterRespo
 @app.get("/task/{client_id}", response_model=TaskResponse)
 async def get_task(
     client_id: str,
-    api_key: Optional[str] = Query(None, alias="api_key")
+    http_request: Request,
+    api_key: Optional[str] = Query(None, alias="api_key"),
+    x_api_key: Optional[str] = Header(None, alias="X-Api-Key"),
+    authorization: Optional[str] = Header(None),
+    x_protocol_version: Optional[str] = Header(None, alias="X-Protocol-Version"),
 ) -> TaskResponse:
     """
     Get a task assignment for a client.
     
     Args:
         client_id: Identifier of the client requesting a task
-        api_key: API key for authentication (query parameter or header)
+        api_key: API key for authentication (``X-Api-Key`` preferred; query legacy)
         
     Returns:
         Task assignment with round_id, model_version, and task details
     """
+    if x_protocol_version:
+        try:
+            negotiate_protocol_version(x_protocol_version)
+        except ProtocolIncompatibleError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    resolved_key = extract_api_key(
+        x_api_key=x_api_key,
+        authorization=authorization,
+        query_api_key=api_key,
+    )
     # Authentication check
-    if auth_manager and not auth_manager.validate_api_key(api_key, client_id):
+    if auth_manager and not auth_manager.validate_api_key(resolved_key, client_id):
         raise HTTPException(
             status_code=401,
             detail="Authentication failed. Valid API key required."
@@ -459,7 +599,8 @@ async def get_task(
                 detail=f"Rate limit exceeded: {reason}"
             )
         rate_limiter.record_request(client_id)
-    
+
+    geo_presence.record(client_id, _client_ip(http_request))
     task = task_assigner.assign_task(client_id)
     
     if task is None:
@@ -490,7 +631,12 @@ async def get_task(
 
 
 @app.post("/update", response_model=UpdateResponse)
-async def submit_update(request: UpdateRequest) -> UpdateResponse:
+async def submit_update(
+    request: UpdateRequest,
+    x_api_key: Optional[str] = Header(None, alias="X-Api-Key"),
+    authorization: Optional[str] = Header(None),
+    x_protocol_version: Optional[str] = Header(None, alias="X-Protocol-Version"),
+) -> UpdateResponse:
     """
     Submit a client update.
     
@@ -500,6 +646,18 @@ async def submit_update(request: UpdateRequest) -> UpdateResponse:
     Returns:
         Update submission response with success status
     """
+    if x_protocol_version:
+        try:
+            negotiate_protocol_version(x_protocol_version)
+        except ProtocolIncompatibleError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    resolved_key = extract_api_key(
+        x_api_key=x_api_key,
+        authorization=authorization,
+        body_api_key=request.api_key,
+    )
+
     # Check if round is closed (straggler detection)
     if async_round_manager and request.round_id in async_round_manager.closed_rounds:
         # This is a straggler - update arrived after round closed
@@ -516,8 +674,20 @@ async def submit_update(request: UpdateRequest) -> UpdateResponse:
         request.client_id,
         request.round_id,
         request.weight_delta,
-        api_key=request.api_key
+        api_key=resolved_key,
     )
+
+    if is_valid:
+        try:
+            parsed_delta = json.loads(request.weight_delta)
+        except (json.JSONDecodeError, TypeError):
+            parsed_delta = request.weight_delta
+        _require_json_size(
+            parsed_delta,
+            env_name="MAX_UPDATE_BYTES",
+            default=25_000_000,
+            label="Update payload",
+        )
     
     if not is_valid:
         # Record rejected update in metrics and reputation
@@ -594,7 +764,7 @@ async def submit_update(request: UpdateRequest) -> UpdateResponse:
 @app.get("/aggregate/{round_id}", response_model=AggregateResponse)
 async def aggregate_classic_round(
     round_id: int,
-    operator_key: Optional[str] = Query(None),
+    operator_key: Optional[str] = Depends(operator_key_value),
 ) -> AggregateResponse:
     """
     Aggregate all updates for a classic FL round (FedAvg).
@@ -831,14 +1001,38 @@ async def get_async_round_stats(round_id: int) -> Dict[str, Any]:
 
 # LoRA Fine-Tuning Endpoints
 
+@app.get("/dashboard/activity")
+async def dashboard_activity() -> Dict[str, Any]:
+    """
+    Anonymized map of recently active clients for the public landing page.
+
+    Locations are city-level with per-client jitter; no IDs or IPs are
+    exposed. Nodes seen in the last 5 minutes are flagged online.
+    """
+    nodes = geo_presence.snapshot()
+    return {
+        "server_time": time.time(),
+        "nodes": nodes,
+        "online_count": sum(1 for n in nodes if n["online"]),
+    }
+
+
 @app.get("/dashboard/overview")
-async def dashboard_overview(limit: int = Query(25, ge=1, le=100)) -> Dict[str, Any]:
+async def dashboard_overview(
+    limit: int = Query(25, ge=1, le=100),
+    operator_key: Optional[str] = Depends(operator_key_value),
+) -> Dict[str, Any]:
     """
     Aggregated payload for the ops UI.
 
     Returns health, global metrics, recent classic rounds, reputations,
     incentives, LoRA base models, and recent LoRA rounds.
+    Job payload/result bodies are redacted unless operator auth succeeds
+    when OPERATOR_API_KEY is configured.
     """
+    include_sensitive = True
+    if get_operator_api_key() is not None:
+        include_sensitive = validate_operator_key(operator_key)
     all_metrics = metrics_collector.get_all_metrics()
     global_metrics = all_metrics.get("global", {})
     round_metrics_map = all_metrics.get("rounds", {})
@@ -875,6 +1069,8 @@ async def dashboard_overview(limit: int = Query(25, ge=1, le=100)) -> Dict[str, 
     return {
         "version": "1.0.0",
         "async_enabled": enable_async,
+        "operator_auth_required": bool(get_operator_api_key()),
+        "server_time": time.time(),
         "global": global_metrics,
         "latest_round": latest or {},
         "classic_rounds": classic_rounds,
@@ -884,7 +1080,10 @@ async def dashboard_overview(limit: int = Query(25, ge=1, le=100)) -> Dict[str, 
         "lora_adapters": adapter_store.list_models(),
         "lora_rounds": lora_round_manager.list_rounds(limit=limit),
         "registered_clients": sorted(list(round_manager.clients)),
-        "jobs": job_queue.list_jobs(limit=min(limit, 25)),
+        "jobs": job_queue.list_jobs(
+            limit=min(limit, 25),
+            include_sensitive=include_sensitive,
+        ),
         "job_stats": job_queue.stats(),
         "classic_models": CLASSIC_MODEL_CATALOG,
         "active_model": {
@@ -898,7 +1097,7 @@ async def dashboard_overview(limit: int = Query(25, ge=1, le=100)) -> Dict[str, 
 @app.post("/rounds/create", response_model=LoRARoundResponse)
 async def create_round(
     request: CreateLoRARoundRequest,
-    operator_key: Optional[str] = Query(None),
+    operator_key: Optional[str] = Depends(operator_key_value),
 ) -> LoRARoundResponse:
     """
     Create a new LoRA fine-tuning round.
@@ -952,7 +1151,8 @@ async def create_round(
         batch_size=request.batch_size,
         gradient_accumulation_steps=request.gradient_accumulation_steps,
         warmup_steps=request.warmup_steps,
-        max_seq_length=request.max_seq_length
+        max_seq_length=request.max_seq_length,
+        task_type=request.task_type,
     )
     
     return LoRARoundResponse(
@@ -1125,60 +1325,69 @@ async def download_adapter(
 async def aggregate_lora_round(
     round_id: int,
     request: AggregateRoundRequest,
-    operator_key: Optional[str] = Query(None),
+    operator_key: Optional[str] = Depends(operator_key_value),
 ) -> AggregateRoundResponse:
     """
-    Aggregate LoRA adapters for a round using FedAvg.
-    
-    Args:
-        round_id: Round identifier
-        request: Aggregation request
-        
-    Returns:
-        AggregateRoundResponse with aggregation results
+    Aggregate LoRA adapters for a round (default ΔW+SVD FedAvg).
     """
     _require_operator(operator_key)
-    # Get round config
     config = get_lora_round(round_id)
     if config is None:
         raise HTTPException(
             status_code=404,
             detail=f"Round {round_id} not found"
         )
-    
+
+    # Idempotent re-aggregate: return previously published adapter
+    if config.state == "CLOSED" and config.published_version:
+        previous = (
+            adapter_store.load_model(config.published_version)
+            if adapter_store.model_exists(config.published_version)
+            else {}
+        )
+        return AggregateRoundResponse(
+            round_id=round_id,
+            adapter_version=config.published_version,
+            status="already_closed",
+            num_adapters=len(lora_round_manager.get_submissions(round_id) or {}),
+            evaluation_passed=bool((previous.get("evaluation") or {}).get("passed")),
+            evaluation_loss=(previous.get("evaluation") or {}).get("loss"),
+            aggregation_strategy=config.aggregation_strategy
+            or (previous.get("manifest") or {}).get("aggregation_strategy"),
+            replayed=True,
+        )
+
     if config.state == "CLOSED":
         raise HTTPException(
             status_code=400,
             detail=f"Round {round_id} is already closed"
         )
-    
-    # Get all submissions
+
     submissions = lora_round_manager.get_submissions(round_id)
     if not submissions:
         raise HTTPException(
             status_code=400,
             detail=f"No adapter submissions for round {round_id}"
         )
+    strategy = request.strategy or os.getenv("LORA_AGG_STRATEGY", "delta_svd")
     lora_round_manager.set_state(round_id, "AGGREGATING")
 
-    # Aggregate adapters
     aggregated_adapter = aggregate_lora_adapters(
         submissions,
-        weight_by_samples=request.weight_by_samples
+        weight_by_samples=request.weight_by_samples,
+        strategy=strategy,
     )
-    
+
     if aggregated_adapter is None:
         lora_round_manager.set_state(round_id, "COLLECTING")
         raise HTTPException(
             status_code=500,
             detail="Failed to aggregate adapters"
         )
-    
-    # Generate new adapter version
+
     version_base = adapter_store.latest_model_version()
     adapter_version = next_version(version_base) if version_base else "v1"
-    
-    # Evaluate adapter on a real configured holdout dataset. No proxy metric.
+
     previous_loss = None
     if config.adapter_version and adapter_store.model_exists(config.adapter_version):
         previous_adapter = adapter_store.load_model(config.adapter_version)
@@ -1191,6 +1400,8 @@ async def aggregate_lora_round(
             status_code=400,
             detail=f"Unknown base model: {config.base_model_id}",
         )
+
+    lora_round_manager.set_state(round_id, "EVALUATING")
     try:
         eval_result = evaluate_adapter(
             round_id=round_id,
@@ -1203,6 +1414,7 @@ async def aggregate_lora_round(
             target_modules=config.target_modules,
             max_seq_length=config.max_seq_length,
             previous_adapter_loss=previous_loss,
+            task_type=getattr(config, "task_type", None) or "causal_lm",
         )
     except Exception as exc:
         lora_round_manager.set_state(round_id, "COLLECTING")
@@ -1216,13 +1428,27 @@ async def aggregate_lora_round(
         and os.getenv("LORA_REJECT_REGRESSION", "false").lower()
         in {"1", "true", "yes"}
     ):
-        lora_round_manager.set_state(round_id, "COLLECTING")
+        lora_round_manager.set_state(round_id, "REJECTED")
         raise HTTPException(
             status_code=422,
             detail="Aggregated adapter regressed on the holdout dataset",
         )
-    
-    # Save adapter
+
+    manifest = build_adapter_manifest(
+        adapter_version=adapter_version,
+        adapter_state_dict=aggregated_adapter,
+        base_model_id=config.base_model_id,
+        round_id=round_id,
+        lora_r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        target_modules=config.target_modules,
+        aggregation_strategy=strategy,
+        task_type=getattr(config, "task_type", "causal_lm"),
+        storage_uri=f"file://adapters/model_{adapter_version}.json",
+        extra_metadata={"num_clients": len(submissions)},
+    )
+    register_adapter_manifest(manifest)
+
     adapter_data = {
         "version": adapter_version,
         "round_id": round_id,
@@ -1235,16 +1461,21 @@ async def aggregate_lora_round(
         },
         "adapter_state_dict": aggregated_adapter,
         "num_clients": len(submissions),
+        "aggregation_strategy": strategy,
+        "task_type": getattr(config, "task_type", "causal_lm"),
+        "manifest": manifest.to_dict(),
         "evaluation": {
             "loss": eval_result.evaluation_loss,
             "passed": eval_result.passed,
             "evaluated": eval_result.evaluated,
             "num_samples": eval_result.num_eval_samples,
             "reason": eval_result.reason,
+            "task_type": eval_result.task_type,
+            "metrics": eval_result.metrics,
         },
         "created_at": time.time()
     }
-    
+
     try:
         adapter_store.save_model(adapter_version, adapter_data)
     except Exception as e:
@@ -1254,17 +1485,20 @@ async def aggregate_lora_round(
             status_code=500,
             detail=f"Failed to save aggregated adapter: {e}"
         )
-    
-    # Close round
+
+    config.published_version = adapter_version
+    config.aggregation_strategy = strategy
     close_lora_round(round_id)
-    
+
     return AggregateRoundResponse(
         round_id=round_id,
         adapter_version=adapter_version,
         status="aggregated",
         num_adapters=len(submissions),
         evaluation_passed=eval_result.passed,
-        evaluation_loss=eval_result.evaluation_loss
+        evaluation_loss=eval_result.evaluation_loss,
+        aggregation_strategy=strategy,
+        replayed=False,
     )
 
 
@@ -1280,6 +1514,46 @@ async def health() -> Dict[str, Any]:
         "job_queue": job_queue.stats(),
         "active_model_id": task_assigner.model_id,
     }
+
+
+@app.get("/ready")
+async def ready() -> Dict[str, Any]:
+    """
+    Readiness for multi-replica / k8s probes.
+
+    Checks metadata backend configuration and artifact store reachability.
+    Liveness remains GET /health.
+    """
+    from persistence.json_repos import metadata_backend
+    from artifacts import get_artifact_store
+
+    backend = metadata_backend()
+    checks: Dict[str, Any] = {
+        "metadata_backend": backend,
+        "artifact_store": os.getenv("ARTIFACT_STORE", "local"),
+        "operator_auth_required": get_operator_api_key() is not None,
+    }
+    try:
+        if backend in ("postgres", "sqlite", "sql"):
+            from persistence.db import get_engine
+            from sqlalchemy import text
+
+            with get_engine().connect() as conn:
+                conn.execute(text("SELECT 1"))
+            checks["database"] = "ok"
+        else:
+            checks["database"] = "skipped"
+        store = get_artifact_store()
+        # Local: root exists; S3: client constructs (head optional probe object)
+        if hasattr(store, "root"):
+            checks["artifacts"] = "ok" if store.root.exists() else "missing_root"
+        else:
+            _ = store.client  # ensure boto3 client builds
+            checks["artifacts"] = "ok"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Readiness check failed: %s", exc)
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "error": str(exc), **checks})
+    return {"status": "ready", **checks}
 
 
 @app.get("/models")
@@ -1299,7 +1573,7 @@ async def list_models() -> Dict[str, Any]:
 @app.post("/models/active")
 async def set_active_model(
     request: SetModelRequest,
-    operator_key: Optional[str] = Query(None),
+    operator_key: Optional[str] = Depends(operator_key_value),
 ) -> Dict[str, Any]:
     """Select which classic architecture new FL rounds use."""
     _require_operator(operator_key)
@@ -1317,7 +1591,7 @@ async def set_active_model(
 @app.post("/jobs")
 async def create_job(
     request: CreateJobRequest,
-    operator_key: Optional[str] = Query(None),
+    operator_key: Optional[str] = Depends(operator_key_value),
 ) -> Dict[str, Any]:
     """Enqueue a non-training job (inference | label | compute)."""
     _require_operator(operator_key)
@@ -1333,12 +1607,17 @@ async def create_job(
         default=1_000_000,
         label="Job payload",
     )
-    job = job_queue.create_job(
-        job_type=request.job_type,
-        payload=request.payload,
-        priority=request.priority,
-        tags=request.tags,
-    )
+    try:
+        job = job_queue.create_job(
+            job_type=request.job_type,
+            payload=request.payload,
+            priority=request.priority,
+            tags=request.tags,
+            max_attempts=request.max_attempts,
+            lease_seconds=request.lease_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return job.to_dict()
 
 
@@ -1347,10 +1626,19 @@ async def list_jobs(
     state: Optional[str] = None,
     job_type: Optional[str] = None,
     limit: int = Query(50, ge=1, le=200),
+    operator_key: Optional[str] = Depends(operator_key_value),
 ) -> Dict[str, Any]:
-    """List jobs in the general queue."""
+    """List jobs. Payload/result bodies require operator auth when OPERATOR_API_KEY is set."""
+    include_sensitive = True
+    if get_operator_api_key() is not None:
+        include_sensitive = validate_operator_key(operator_key)
     return {
-        "jobs": job_queue.list_jobs(state=state, job_type=job_type, limit=limit),
+        "jobs": job_queue.list_jobs(
+            state=state,
+            job_type=job_type,
+            limit=limit,
+            include_sensitive=include_sensitive,
+        ),
         "stats": job_queue.stats(),
     }
 
@@ -1359,13 +1647,20 @@ async def list_jobs(
 async def claim_job(
     client_id: str,
     api_key: Optional[str] = Query(None),
+    x_api_key: Optional[str] = Header(None, alias="X-Api-Key"),
+    authorization: Optional[str] = Header(None),
     types: Optional[str] = Query(
         None,
         description="Comma-separated job types, e.g. inference,compute",
     ),
 ) -> Dict[str, Any]:
     """Claim the next queued job for a volunteer/edge client."""
-    if not auth_manager.validate_api_key(api_key, client_id):
+    resolved = extract_api_key(
+        x_api_key=x_api_key,
+        authorization=authorization,
+        query_api_key=api_key,
+    )
+    if not auth_manager.validate_api_key(resolved, client_id):
         raise HTTPException(status_code=401, detail="Authentication failed")
     type_set = None
     if types:
@@ -1373,15 +1668,60 @@ async def claim_job(
     job = job_queue.claim_next(client_id, job_types=type_set)
     if job is None:
         return {"job": None, "message": "No jobs available"}
-    return {"job": job.to_dict()}
+    return {
+        "job": job.to_dict(include_sensitive=True),
+        "lease_seconds": job.lease_seconds or job_queue.lease_seconds,
+        "lease_expires_at": job.lease_expires_at,
+    }
+
+
+@app.post("/jobs/{job_id}/lease")
+async def extend_job_lease(
+    job_id: str,
+    client_id: str = Query(...),
+    api_key: Optional[str] = Query(None),
+    x_api_key: Optional[str] = Header(None, alias="X-Api-Key"),
+    authorization: Optional[str] = Header(None),
+    extend_seconds: Optional[float] = Query(None),
+) -> Dict[str, Any]:
+    """Heartbeat: extend the lease for a claimed job."""
+    resolved = extract_api_key(
+        x_api_key=x_api_key,
+        authorization=authorization,
+        query_api_key=api_key,
+    )
+    if not auth_manager.validate_api_key(resolved, client_id):
+        raise HTTPException(status_code=401, detail="Authentication failed")
+    try:
+        job = job_queue.extend_lease(
+            job_id, client_id, extend_seconds=extend_seconds
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found or not assigned to this client",
+        )
+    return {
+        "job_id": job.job_id,
+        "lease_expires_at": job.lease_expires_at,
+        "lease_seconds": job.lease_seconds or job_queue.lease_seconds,
+    }
 
 
 @app.get("/jobs/{job_id}")
-async def get_job(job_id: str) -> Dict[str, Any]:
+async def get_job(
+    job_id: str,
+    operator_key: Optional[str] = Depends(operator_key_value),
+) -> Dict[str, Any]:
     job = job_queue.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job.to_dict()
+    include_sensitive = True
+    if get_operator_api_key() is not None:
+        include_sensitive = validate_operator_key(operator_key)
+    return job.to_dict(include_sensitive=include_sensitive)
 
 
 @app.post("/jobs/{job_id}/result")
@@ -1410,7 +1750,7 @@ async def submit_job_result(job_id: str, request: JobResultRequest) -> Dict[str,
 @app.post("/jobs/{job_id}/cancel")
 async def cancel_job(
     job_id: str,
-    operator_key: Optional[str] = Query(None),
+    operator_key: Optional[str] = Depends(operator_key_value),
 ) -> Dict[str, Any]:
     """Cancel a queued, assigned, or failed job."""
     _require_operator(operator_key)
@@ -1418,6 +1758,47 @@ async def cancel_job(
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found or already final")
     return job.to_dict()
+
+
+class DatasetAliasRequest(BaseModel):
+    alias: str
+    description: str = ""
+    format_hint: Optional[str] = None
+    required_env: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+@app.get("/datasets/aliases")
+async def list_dataset_aliases(
+    operator_key: Optional[str] = Depends(operator_key_value),
+) -> Dict[str, Any]:
+    """List registered dataset aliases (no absolute paths)."""
+    _require_operator(operator_key)
+    from jobs import get_dataset_alias_registry
+
+    return {"aliases": get_dataset_alias_registry().list_aliases()}
+
+
+@app.post("/datasets/aliases")
+async def upsert_dataset_alias(
+    request: DatasetAliasRequest,
+    operator_key: Optional[str] = Depends(operator_key_value),
+) -> Dict[str, Any]:
+    """Register or update a dataset alias (workers map alias → local path)."""
+    _require_operator(operator_key)
+    from jobs import get_dataset_alias_registry
+
+    try:
+        record = get_dataset_alias_registry().upsert(
+            request.alias,
+            description=request.description,
+            format_hint=request.format_hint,
+            required_env=request.required_env,
+            metadata=request.metadata,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return record.to_dict()
 
 
 @app.get("/launch")
@@ -1429,7 +1810,7 @@ async def launch_status() -> Dict[str, Any]:
 @app.post("/launch")
 async def launch_process(
     request: LaunchRequest,
-    operator_key: Optional[str] = Query(None),
+    operator_key: Optional[str] = Depends(operator_key_value),
 ) -> Dict[str, Any]:
     """Start local train clients or job workers (dev/ops UI)."""
     _require_operator(operator_key)
@@ -1481,7 +1862,7 @@ async def launch_process(
 @app.post("/launch/demo")
 async def launch_demo(
     request: LaunchDemoRequest,
-    operator_key: Optional[str] = Query(None),
+    operator_key: Optional[str] = Depends(operator_key_value),
 ) -> Dict[str, Any]:
     """One-click: set model, start train clients + worker, enqueue sample job."""
     _require_operator(operator_key)
@@ -1539,7 +1920,7 @@ async def launch_demo(
 @app.post("/launch/{process_id}/stop")
 async def stop_launch(
     process_id: str,
-    operator_key: Optional[str] = Query(None),
+    operator_key: Optional[str] = Depends(operator_key_value),
 ) -> Dict[str, Any]:
     _require_operator(operator_key)
     ok = local_launcher.stop(process_id)
@@ -1551,7 +1932,7 @@ async def stop_launch(
 @app.post("/launch/stop-all")
 async def stop_all_launch(
     kind: Optional[str] = Query(None),
-    operator_key: Optional[str] = Query(None),
+    operator_key: Optional[str] = Depends(operator_key_value),
 ) -> Dict[str, Any]:
     _require_operator(operator_key)
     n = local_launcher.stop_all(kind=kind)
@@ -1563,6 +1944,7 @@ async def root():
     """Root endpoint with API information."""
     endpoints = {
         "health": "GET /health",
+        "ready": "GET /ready",
         "register_client": "POST /client/register",
         "get_task": "GET /task/{client_id}",
         "submit_update": "POST /update",

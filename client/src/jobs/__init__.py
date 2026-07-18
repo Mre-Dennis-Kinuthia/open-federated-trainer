@@ -7,7 +7,8 @@ import json
 import os
 import time
 from functools import lru_cache
-from typing import Any, Callable, Dict, Iterable, List, Sequence
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 from private_datasets import load_local_dataset
 
@@ -45,6 +46,43 @@ def _pipeline(task: str, model_id: str, revision: str):
     )
 
 
+def _resolve_dataset_alias(alias: str) -> Optional[str]:
+    """Map a coordinator dataset_alias to a local path on this worker."""
+    # Prefer explicit JSON map: DATASET_ALIASES={"reviews":"/data/reviews.jsonl"}
+    raw = os.getenv("DATASET_ALIASES", "").strip()
+    if raw:
+        try:
+            mapping = json.loads(raw)
+            if isinstance(mapping, dict) and alias in mapping:
+                return str(mapping[alias])
+        except json.JSONDecodeError:
+            pass
+    # Env convention: DATASET_ALIAS_<name>
+    env_key = f"DATASET_ALIAS_{alias}"
+    if os.getenv(env_key):
+        return os.getenv(env_key)
+    # Optional local file: client/data/dataset_aliases.json
+    alias_file = Path(
+        os.getenv(
+            "DATASET_ALIAS_FILE",
+            str(Path(__file__).resolve().parents[1] / "data" / "dataset_aliases.json"),
+        )
+    )
+    if alias_file.exists():
+        try:
+            data = json.loads(alias_file.read_text(encoding="utf-8"))
+            mapping = data.get("aliases") if isinstance(data, dict) else None
+            if isinstance(mapping, dict) and alias in mapping:
+                entry = mapping[alias]
+                if isinstance(entry, str):
+                    return entry
+                if isinstance(entry, dict) and entry.get("path"):
+                    return str(entry["path"])
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+    return None
+
+
 def _private_inputs(payload: Dict[str, Any]) -> List[Any]:
     supplied = payload.get("inputs")
     if supplied is not None:
@@ -52,8 +90,18 @@ def _private_inputs(payload: Dict[str, Any]) -> List[Any]:
             raise JobConfigurationError("payload.inputs must be a non-empty list")
         return supplied
 
+    dataset_path = payload.get("dataset_path")
+    alias = payload.get("dataset_alias")
+    if alias and not dataset_path:
+        dataset_path = _resolve_dataset_alias(str(alias))
+        if not dataset_path:
+            raise JobConfigurationError(
+                f"dataset_alias {alias!r} is not mapped on this worker. "
+                "Set DATASET_ALIASES JSON or DATASET_ALIAS_<name>."
+            )
+
     dataset = load_local_dataset(
-        path=payload.get("dataset_path"),
+        path=dataset_path,
         fmt=payload.get("dataset_format"),
     )
     start = max(0, int(payload.get("offset", 0)))
@@ -175,36 +223,10 @@ def handle_label(job: Dict[str, Any], client_id: str) -> Dict[str, Any]:
     }
 
 
-def _allowed_compute_modules() -> List[str]:
-    return [
-        item.strip()
-        for item in os.getenv("COMPUTE_PLUGIN_ALLOWLIST", "").split(",")
-        if item.strip()
-    ]
-
-
-def _load_compute_plugin(entrypoint: str) -> Callable[[Dict[str, Any]], Any]:
-    if ":" not in entrypoint:
-        raise JobConfigurationError("compute entrypoint must be module.path:function")
-    module_name, function_name = entrypoint.split(":", 1)
-    allowed = _allowed_compute_modules()
-    if not allowed or not any(
-        module_name == prefix or module_name.startswith(f"{prefix}.")
-        for prefix in allowed
-    ):
-        raise JobConfigurationError(
-            f"Compute module {module_name!r} is not allowlisted. Set "
-            "COMPUTE_PLUGIN_ALLOWLIST on the worker."
-        )
-    module = importlib.import_module(module_name)
-    function = getattr(module, function_name, None)
-    if not callable(function):
-        raise JobConfigurationError(f"Compute entrypoint is not callable: {entrypoint}")
-    return function
-
-
 def handle_compute(job: Dict[str, Any], client_id: str) -> Dict[str, Any]:
     """Run an operator-installed, explicitly allowlisted compute work unit."""
+    from runtime import EntrypointRejected, RuntimeError_, get_compute_runtime
+
     payload = job.get("payload") or {}
     entrypoint = str(payload.get("entrypoint") or "").strip()
     if not entrypoint:
@@ -216,8 +238,15 @@ def handle_compute(job: Dict[str, Any], client_id: str) -> Dict[str, Any]:
     if not isinstance(work_unit, dict):
         raise JobConfigurationError("payload.work_unit must be a JSON object")
 
-    started = time.monotonic()
-    result = _load_compute_plugin(entrypoint)(work_unit)
+    try:
+        runtime = get_compute_runtime()
+        executed = runtime.execute(entrypoint, work_unit)
+    except EntrypointRejected as exc:
+        raise JobConfigurationError(str(exc)) from exc
+    except RuntimeError_ as exc:
+        raise JobConfigurationError(str(exc)) from exc
+
+    result = executed.get("result", executed)
     try:
         json.dumps(result)
     except (TypeError, ValueError) as exc:
@@ -225,10 +254,10 @@ def handle_compute(job: Dict[str, Any], client_id: str) -> Dict[str, Any]:
     return {
         "job_type": "compute",
         "client_id": client_id,
-        "backend": "python-plugin",
+        "backend": executed.get("runtime", "python-plugin"),
         "entrypoint": entrypoint,
         "result": result,
-        "elapsed_seconds": round(time.monotonic() - started, 6),
+        "elapsed_seconds": executed.get("elapsed_seconds"),
     }
 
 

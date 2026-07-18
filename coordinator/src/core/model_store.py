@@ -70,9 +70,11 @@ class ModelStore:
         model_path = self._get_model_path(version)
         
         try:
-            # Write model data as JSON
-            with open(model_path, 'w') as f:
+            # Atomic replace to avoid truncated model files on crash.
+            tmp = model_path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(model_data, f, indent=2)
+            os.replace(tmp, model_path)
         except Exception as e:
             raise IOError(f"Failed to save model {version}: {e}")
     

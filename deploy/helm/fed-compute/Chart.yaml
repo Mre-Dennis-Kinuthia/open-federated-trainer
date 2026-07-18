@@ -1,0 +1,6 @@
+apiVersion: v2
+name: fed-compute
+description: Federated compute coordinator (API replicas + external PG/S3)
+type: application
+version: 0.8.0
+appVersion: "1.1.0"

@@ -50,13 +50,15 @@ class IncentiveManager:
     Manages token-based incentives for federated learning clients.
     
     This is a simulation system for research, not real currency.
+    Optional SQL repo enables multi-replica shared state.
     """
     
     def __init__(
         self,
         base_reward_per_update: float = 10.0,
         speed_bonus_threshold: float = 30.0,  # seconds
-        consistency_bonus_threshold: int = 5  # consecutive rounds
+        consistency_bonus_threshold: int = 5,  # consecutive rounds
+        repo=None,
     ):
         """
         Initialize the incentive manager.
@@ -65,16 +67,60 @@ class IncentiveManager:
             base_reward_per_update: Base tokens awarded per accepted update
             speed_bonus_threshold: Latency threshold for speed bonus (seconds)
             consistency_bonus_threshold: Consecutive rounds for consistency bonus
+            repo: Optional shared SQL repository
         """
         self.base_reward_per_update = base_reward_per_update
         self.speed_bonus_threshold = speed_bonus_threshold
         self.consistency_bonus_threshold = consistency_bonus_threshold
+        self.repo = repo
         
         self.client_incentives: Dict[str, ClientIncentives] = {}
         # Track consecutive completions for consistency bonus
         self.consecutive_completions: Dict[str, int] = defaultdict(int)
         # Track last completion time for speed bonus
         self.last_completion_times: Dict[str, float] = {}
+        if self.repo is not None:
+            self._reload_from_repo()
+
+    def _reload_from_repo(self) -> None:
+        if self.repo is None:
+            return
+        for data in self.repo.list_all():
+            client_id = data["client_id"]
+            self.client_incentives[client_id] = ClientIncentives(
+                client_id=client_id,
+                total_tokens_earned=float(data.get("total_tokens_earned", 0.0)),
+                tokens_spent=float(data.get("tokens_spent", 0.0)),
+                rewards_received=list(data.get("rewards_received") or []),
+                speed_bonuses=int(data.get("speed_bonuses", 0)),
+                consistency_bonuses=int(data.get("consistency_bonuses", 0)),
+            )
+            self.consecutive_completions[client_id] = int(
+                data.get("consecutive_completions", 0)
+            )
+            if data.get("last_completion_time") is not None:
+                self.last_completion_times[client_id] = float(
+                    data["last_completion_time"]
+                )
+
+    def _persist(self, client_id: str) -> None:
+        if self.repo is None or client_id not in self.client_incentives:
+            return
+        client = self.client_incentives[client_id]
+        self.repo.save(
+            {
+                "client_id": client.client_id,
+                "total_tokens_earned": client.total_tokens_earned,
+                "tokens_spent": client.tokens_spent,
+                "speed_bonuses": client.speed_bonuses,
+                "consistency_bonuses": client.consistency_bonuses,
+                "rewards_received": list(client.rewards_received),
+                "consecutive_completions": int(
+                    self.consecutive_completions.get(client_id, 0)
+                ),
+                "last_completion_time": self.last_completion_times.get(client_id),
+            }
+        )
     
     def _get_or_create_client(self, client_id: str) -> ClientIncentives:
         """Get or create incentive record for a client."""
@@ -135,6 +181,7 @@ class IncentiveManager:
         # Update consecutive completions
         self.consecutive_completions[client_id] += 1
         self.last_completion_times[client_id] = time.time()
+        self._persist(client_id)
         
         return tokens
     
@@ -146,41 +193,25 @@ class IncentiveManager:
             client_id: Identifier of the client
         """
         self.consecutive_completions[client_id] = 0
+        if client_id in self.client_incentives:
+            self._persist(client_id)
     
     def get_client_incentives(self, client_id: str) -> Optional[ClientIncentives]:
-        """
-        Get incentive data for a client.
-        
-        Args:
-            client_id: Identifier of the client
-            
-        Returns:
-            ClientIncentives object or None if not found
-        """
+        if self.repo is not None:
+            self._reload_from_repo()
         return self.client_incentives.get(client_id)
     
     def get_client_balance(self, client_id: str) -> float:
-        """
-        Get current token balance for a client.
-        
-        Args:
-            client_id: Identifier of the client
-            
-        Returns:
-            Current token balance (0.0 if client not found)
-        """
+        if self.repo is not None:
+            self._reload_from_repo()
         client = self.client_incentives.get(client_id)
         if client:
             return client.current_balance
         return 0.0
     
     def get_all_incentives(self) -> Dict[str, Dict]:
-        """
-        Get all client incentive data.
-        
-        Returns:
-            Dictionary mapping client_id to incentive data
-        """
+        if self.repo is not None:
+            self._reload_from_repo()
         return {
             client_id: client.to_dict()
             for client_id, client in self.client_incentives.items()

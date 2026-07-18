@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 import uuid
 
@@ -20,6 +21,7 @@ from config import config
 from api import (
     register_client,
     claim_job,
+    extend_job_lease,
     submit_job_result,
     CoordinatorAPIError,
     CoordinatorConnectionError,
@@ -38,6 +40,20 @@ def _job_types() -> str:
     # Strip train if present — this worker is non-training
     parts = [p.strip() for p in raw.split(",") if p.strip() and p.strip() != "train"]
     return ",".join(parts) or "inference,label,compute"
+
+
+def _lease_heartbeat(
+    stop: threading.Event,
+    job_id: str,
+    client_id: str,
+    api_key: str,
+    interval: float,
+) -> None:
+    while not stop.wait(interval):
+        try:
+            extend_job_lease(job_id, client_id, api_key=api_key)
+        except Exception as exc:
+            print(f"[{client_id}] Lease heartbeat failed for {job_id}: {exc}")
 
 
 def main() -> None:
@@ -61,6 +77,7 @@ def main() -> None:
         sys.exit(1)
 
     sleep_s = float(os.getenv("JOB_POLL_SECONDS", str(config.SLEEP_BETWEEN_ROUNDS)))
+    heartbeat_s = float(os.getenv("JOB_LEASE_HEARTBEAT_SECONDS", "60"))
 
     while True:
         try:
@@ -78,6 +95,13 @@ def main() -> None:
                 "job_type": jtype,
             })
 
+            stop = threading.Event()
+            hb = threading.Thread(
+                target=_lease_heartbeat,
+                args=(stop, jid, client_id, api_key, heartbeat_s),
+                daemon=True,
+            )
+            hb.start()
             try:
                 result = run_job(job, client_id)
                 submit_job_result(jid, client_id, result, api_key=api_key, success=True)
@@ -99,6 +123,8 @@ def main() -> None:
                     )
                 except Exception as submit_err:
                     print(f"[{client_id}] Could not report failure: {submit_err}")
+            finally:
+                stop.set()
 
         except KeyboardInterrupt:
             print("\nShutting down worker")

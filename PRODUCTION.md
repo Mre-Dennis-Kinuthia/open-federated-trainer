@@ -34,9 +34,10 @@ This document tracks what was hardened toward production use and what remains.
 | Scheduling | Reputation-weighted client selection / FedAvg weights |
 | LoRA | Asynchronous evaluation and resumable/chunked adapter uploads for very large adapters |
 | Observability | Prometheus metrics; structured log shipping |
-| Scale | Multi-coordinator / Redis-backed state for HA |
+| Scale | Compose/Helm multi-replica + PG/S3; residual in-memory state (geo/reputation) |
 | Data | Optional DP; richer feature extractors (beyond CSV/JSONL/HF loaders) |
-| Jobs | Redis/Postgres queue backend for multi-coordinator HA and sandboxed plugin containers |
+| Jobs | Sandboxed plugin containers; queue shared via SQL when `METADATA_BACKEND=postgres` |
+| Deploy | See `docs/deploy/PRODUCTION_DEPLOY.md` + Helm chart |
 
 ## Recommended operator env
 

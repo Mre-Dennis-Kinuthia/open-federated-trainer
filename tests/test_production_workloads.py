@@ -62,7 +62,20 @@ def test_image_folder_decodes_actual_pixels(tmp_path, monkeypatch):
 def test_inference_requires_real_model(monkeypatch):
     monkeypatch.syspath_prepend(str(CLIENT_SRC))
     monkeypatch.delenv("INFERENCE_MODEL_ID", raising=False)
-    from jobs import JobConfigurationError, run_job
+    # Prefer client jobs package over coordinator/src/jobs
+    sys.modules.pop("jobs", None)
+    import importlib
+    jobs_mod = importlib.import_module("jobs")
+    # If coordinator won, force client path
+    if not hasattr(jobs_mod, "run_job"):
+        import importlib.util
+        path = CLIENT_SRC / "jobs" / "__init__.py"
+        spec = importlib.util.spec_from_file_location("client_jobs_inference", path)
+        assert spec and spec.loader
+        jobs_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(jobs_mod)
+    JobConfigurationError = jobs_mod.JobConfigurationError
+    run_job = jobs_mod.run_job
 
     try:
         run_job(
@@ -79,7 +92,15 @@ def test_allowlisted_science_plugin(monkeypatch):
     monkeypatch.syspath_prepend(str(CLIENT_SRC))
     monkeypatch.syspath_prepend(str(ROOT / "client"))
     monkeypatch.setenv("COMPUTE_PLUGIN_ALLOWLIST", "examples.science_plugin")
-    from jobs import run_job
+    import importlib.util
+    path = CLIENT_SRC / "jobs" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("client_jobs_compute", path)
+    assert spec and spec.loader
+    jobs_mod = importlib.util.module_from_spec(spec)
+    # Ensure client package root for examples.*
+    sys.path.insert(0, str(ROOT / "client"))
+    spec.loader.exec_module(jobs_mod)
+    run_job = jobs_mod.run_job
 
     result = run_job(
         {
@@ -94,7 +115,7 @@ def test_allowlisted_science_plugin(monkeypatch):
         },
         "client-1",
     )
-    assert result["backend"] == "python-plugin"
+    assert result["backend"] == "local_import"
     assert result["result"]["particle_count"] == 2
 
 
