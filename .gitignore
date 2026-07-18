@@ -1,14 +1,17 @@
 # Python
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
 
-# Virtual environments
+# Virtual environments (never commit local envs)
 venv/
+**/venv/
 env/
 ENV/
+.venv/
 .venv
 
 # IDE
