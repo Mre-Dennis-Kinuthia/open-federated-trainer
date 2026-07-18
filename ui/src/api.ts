@@ -123,15 +123,36 @@ export type CreateLoraPayload = {
   max_seq_length?: number;
 };
 
-// Dev: Vite proxies /api → coordinator. Prod: same-origin (nginx /ui) or
-// absolute API via VITE_API_BASE (e.g. https://api.example.com for Vercel).
-const API_BASE = (
+// Dev: Vite proxies /api → coordinator. Prod: same-origin (nginx /ui),
+// VITE_API_BASE at build time, or a runtime override in Settings (Vercel).
+const BUILD_API_BASE = (
   (import.meta.env.VITE_API_BASE as string | undefined)?.trim() ||
   (import.meta.env.DEV ? "/api" : "")
 ).replace(/\/$/, "");
+const API_BASE_STORAGE = "fed-compute.api-base";
 const OPERATOR_KEY_STORAGE = "fed-compute.operator-key";
 const BUILD_TIME_KEY =
   (import.meta.env.VITE_OPERATOR_API_KEY as string | undefined)?.trim() || "";
+
+export function getApiBase(): string {
+  try {
+    const stored = window.localStorage.getItem(API_BASE_STORAGE);
+    if (stored !== null) return stored.replace(/\/$/, "");
+  } catch {
+    /* storage unavailable */
+  }
+  return BUILD_API_BASE;
+}
+
+export function setApiBase(url: string): void {
+  try {
+    const cleaned = url.trim().replace(/\/$/, "");
+    if (cleaned) window.localStorage.setItem(API_BASE_STORAGE, cleaned);
+    else window.localStorage.removeItem(API_BASE_STORAGE);
+  } catch {
+    /* storage unavailable */
+  }
+}
 
 export function getOperatorKey(): string {
   try {
@@ -169,7 +190,24 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const operatorKey = getOperatorKey();
   if (operatorKey) headers["X-Operator-Key"] = operatorKey;
 
-  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  const base = getApiBase();
+  const res = await fetch(`${base}${path}`, { ...init, headers });
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    const snippet = (await res.text()).slice(0, 80);
+    if (snippet.trimStart().startsWith("<!") || snippet.includes("<html")) {
+      throw new ApiError(
+        res.status,
+        base
+          ? `Coordinator returned HTML instead of JSON (${res.status}). Check the API URL in Settings.`
+          : "No coordinator URL set. Open Settings and set the API base (e.g. https://127.0.0.1:8443)."
+      );
+    }
+    throw new ApiError(
+      res.status,
+      `Unexpected non-JSON response (${res.status}). Set the coordinator API URL in Settings.`
+    );
+  }
   if (!res.ok) {
     let detail = res.statusText;
     try {

@@ -402,7 +402,7 @@ export default function App() {
       ? "Attention needed"
       : "API reachable";
   const healthDetail = !online
-    ? "Check that the API is running on :8000."
+    ? "Set the coordinator API URL in Settings (Vercel cannot proxy to localhost by itself)."
     : failed > 0
       ? `${failed} failed update(s) recorded — check client logs and round states.`
       : "Overview reachable and no failed updates recorded. This is not a full system health check.";
