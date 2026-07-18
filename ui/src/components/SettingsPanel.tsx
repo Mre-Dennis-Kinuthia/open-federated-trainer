@@ -18,10 +18,13 @@ export function SettingsPanel({ authRequired, onSaved }: Props) {
       </div>
       <div className="card-bd">
         <p className="help">
-          On Vercel the UI is static — set the coordinator API URL so requests
-          do not hit this site&apos;s HTML. For the HA lab stack use{" "}
-          <code>https://127.0.0.1:8443</code> (accept the self-signed cert in a
-          tab first). Local Vite already proxies <code>/api</code>.
+          On Vercel (HTTPS) the browser will not call plain{" "}
+          <code>http://</code> APIs (mixed content), and self-signed{" "}
+          <code>https://localhost:8443</code> fails with{" "}
+          <code>ERR_CERT_AUTHORITY_INVALID</code> until the cert is trusted.
+          Easiest lab path: use the local Vite UI at{" "}
+          <code>http://127.0.0.1:5173</code> (proxies to the edge). Or trust the
+          lab cert / use an HTTPS tunnel, then set that URL here.
         </p>
         <div className="form-grid one">
           <div className="field">
