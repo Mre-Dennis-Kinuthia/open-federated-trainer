@@ -123,7 +123,12 @@ export type CreateLoraPayload = {
   max_seq_length?: number;
 };
 
-const API_BASE = import.meta.env.DEV ? "/api" : "";
+// Dev: Vite proxies /api → coordinator. Prod: same-origin (nginx /ui) or
+// absolute API via VITE_API_BASE (e.g. https://api.example.com for Vercel).
+const API_BASE = (
+  (import.meta.env.VITE_API_BASE as string | undefined)?.trim() ||
+  (import.meta.env.DEV ? "/api" : "")
+).replace(/\/$/, "");
 const OPERATOR_KEY_STORAGE = "fed-compute.operator-key";
 const BUILD_TIME_KEY =
   (import.meta.env.VITE_OPERATOR_API_KEY as string | undefined)?.trim() || "";
