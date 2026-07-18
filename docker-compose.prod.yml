@@ -1,11 +1,13 @@
-# Production-oriented stack: Postgres + MinIO + 2 API replicas + nginx LB.
+# Production-oriented stack: Postgres + MinIO + 2 API replicas + nginx LB + train clients.
 # Does not change the default `docker compose up` quick-start path.
 #
+#   ./scripts/stop-local-trainers.sh   # optional: kill host ui-train clients on :8000
+#   ./scripts/gen-dev-certs.sh
 #   export OPERATOR_API_KEY="$(openssl rand -hex 16)"
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile production up -d --build
 #
 # API via TLS edge: https://localhost:8443  (HTTP :8080 redirects)
-# First: ./scripts/gen-dev-certs.sh
+# Train clients talk to coordinator-a/b on the Docker network (not the JSON :8000 service).
 
 x-coordinator-env: &coordinator-env
   PYTHONUNBUFFERED: "1"
@@ -39,7 +41,39 @@ x-coordinator-health: &coordinator-health
   retries: 12
   start_period: 45s
 
+x-train-client: &train-client
+  profiles: ["production"]
+  build:
+    context: ./client
+    dockerfile: Dockerfile
+  environment:
+    COORDINATOR_URL: http://coordinator-a:8000
+    ALLOW_SYNTHETIC_DATA: ${ALLOW_SYNTHETIC_DATA:-true}
+    DATASET_PATH: ${DATASET_PATH:-}
+    CLIENT_API_KEY: ${CLIENT_API_KEY:-}
+    MAX_RETRIES: "3"
+    SLEEP_BETWEEN_ROUNDS: "5.0"
+    RETRY_DELAY: "2.0"
+    PYTHONUNBUFFERED: "1"
+  depends_on:
+    coordinator-a:
+      condition: service_healthy
+    coordinator-b:
+      condition: service_healthy
+  restart: unless-stopped
+  networks:
+    - federated-network
+
 services:
+  # Keep the JSON single-node coordinator off the production profile so :8000
+  # is not mixed with the HA edge. Use plain `docker compose up` for that path.
+  coordinator:
+    profiles: ["json-demo"]
+
+  # Base `client` service is replaced by client-1/client-2 below under production.
+  client:
+    profiles: ["json-demo"]
+
   postgres:
     profiles: ["durable", "production"]
 
@@ -116,3 +150,41 @@ services:
     restart: unless-stopped
     networks:
       - federated-network
+
+  # Two synthetic demo trainers so ASYNC_MIN_UPDATES=2 can aggregate.
+  # Override ALLOW_SYNTHETIC_DATA=false and mount DATASET_PATH for real data.
+  client-1:
+    <<: *train-client
+    container_name: federated-client-1
+    environment:
+      COORDINATOR_URL: http://coordinator-a:8000
+      ALLOW_SYNTHETIC_DATA: ${ALLOW_SYNTHETIC_DATA:-true}
+      DATASET_PATH: ${DATASET_PATH:-}
+      CLIENT_NAME: prod-client-a
+      MAX_RETRIES: "3"
+      SLEEP_BETWEEN_ROUNDS: "5.0"
+      RETRY_DELAY: "2.0"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - client-keys-1:/app/data
+
+  client-2:
+    <<: *train-client
+    container_name: federated-client-2
+    environment:
+      # Same replica as client-1 so async min-updates aggregation sees both
+      # submissions in-process; HA state still shared via Postgres.
+      COORDINATOR_URL: http://coordinator-a:8000
+      ALLOW_SYNTHETIC_DATA: ${ALLOW_SYNTHETIC_DATA:-true}
+      DATASET_PATH: ${DATASET_PATH:-}
+      CLIENT_NAME: prod-client-b
+      MAX_RETRIES: "3"
+      SLEEP_BETWEEN_ROUNDS: "5.0"
+      RETRY_DELAY: "2.0"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - client-keys-2:/app/data
+
+volumes:
+  client-keys-1:
+  client-keys-2:

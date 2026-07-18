@@ -7,8 +7,8 @@ import type { Position } from "../components/Globe";
  * anonymized (city-level + per-client jitter) — see /dashboard/activity.
  */
 
-const ONLINE_COLOR = "#0070f3";
-const RECENT_COLOR = "#6366f1";
+const ONLINE_COLOR = "#0f6b5c";
+const RECENT_COLOR = "#5a6578";
 
 /** Build globe arcs connecting recently active nodes to each other. */
 export function buildActivityArcs(nodes: ActivityNode[]): Position[] {

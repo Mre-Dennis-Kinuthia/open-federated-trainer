@@ -66,11 +66,18 @@ class TaskAssigner:
             existing_assignment = self.client_assignments[client_id]
             round_id = existing_assignment.get("round_id")
             round_status = self.round_manager.get_round_status(round_id)
-            
-            if round_status and round_status["state"] in ["OPEN", "COLLECTING"]:
-                if round_status["total_updates"] < round_status["total_clients"]:
-                    return existing_assignment
-                del self.client_assignments[client_id]
+            round_obj = self.round_manager.rounds.get(round_id)
+
+            if (
+                round_status
+                and round_status["state"] in ["OPEN", "COLLECTING"]
+                and round_obj
+                and client_id not in round_obj.updates_received
+            ):
+                # Client still owes an update for this round.
+                return existing_assignment
+            # Submitted already (or round gone) — clear and join/create a round.
+            self.client_assignments.pop(client_id, None)
         
         round_id = self.round_manager.assign_client_to_round(client_id, self.model_version)
         if round_id is None:

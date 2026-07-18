@@ -12,11 +12,17 @@ docker compose up          # JSON + local artifacts, single coordinator :8000
 ## Production Compose profile (TLS lab edge)
 
 ```bash
-./scripts/gen-dev-certs.sh   # self-signed → deploy/certs/
+./scripts/stop-local-trainers.sh   # stop host ui-train clients that talk to :8000
+./scripts/gen-dev-certs.sh         # self-signed → deploy/certs/
 export OPERATOR_API_KEY="$(openssl rand -hex 16)"
 docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile production up -d --build
 curl -sk https://localhost:8443/ready
+curl -sk 'https://localhost:8443/dashboard/overview?limit=5'
 ```
+
+The production profile **does not** start the JSON single-node `coordinator` on `:8000`.
+Train traffic goes to `coordinator-a` / `coordinator-b` via `client-1` / `client-2`
+(synthetic demo data by default; set `ALLOW_SYNTHETIC_DATA=false` + `DATASET_PATH` for real corpora).
 
 | Component | Role |
 |-----------|------|
@@ -24,6 +30,7 @@ curl -sk https://localhost:8443/ready
 | `minio` + `minio-init` | Artifact bucket `fedcompute-artifacts` |
 | `coordinator-a` / `coordinator-b` | API replicas (`SHARED_STATE=auto`) |
 | `edge` (nginx) | TLS on `:8443`; HTTP `:8080` redirects to HTTPS |
+| `client-1` / `client-2` | Demo trainers (synthetic unless `DATASET_PATH` set) |
 
 Compose TLS uses **self-signed** certs for lab use. Production should terminate TLS at a cloud LB / Ingress with a real CA (see Helm).
 

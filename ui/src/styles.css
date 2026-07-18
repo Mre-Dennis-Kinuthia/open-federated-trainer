@@ -1,29 +1,32 @@
+@import "./tokens.css";
+
 :root {
-  --bg: #ffffff;
-  --bg-subtle: #fafafa;
-  --bg-hover: #f5f5f5;
-  --bg-active: #ebebeb;
-  --border: #eaeaea;
-  --border-strong: #d4d4d4;
-  --text: #171717;
-  --text-secondary: #555555;
-  --text-tertiary: #6f6f6f; /* 4.5:1 on white */
-  --accent: #0070f3;
-  --accent-soft: #e8f3ff;
-  --ok: #0a7b45;
-  --ok-bg: #e8f8ef;
-  --warn: #8a4f00;
-  --warn-bg: #fff6e5;
-  --danger: #c92a2f;
-  --danger-bg: #ffecec;
-  --chart-blue: #0070f3;
+  /* Console maps onto shared fed-compute brand tokens */
+  --bg: #f7f9fc;
+  --bg-subtle: var(--fc-paper);
+  --bg-hover: var(--fc-paper-2);
+  --bg-active: #d4dae4;
+  --border: var(--fc-line);
+  --border-strong: #aeb8c7;
+  --text: var(--fc-ink);
+  --text-secondary: var(--fc-mute);
+  --text-tertiary: #6a7588;
+  --accent: var(--fc-accent);
+  --accent-soft: var(--fc-accent-soft);
+  --ok: var(--fc-ok);
+  --ok-bg: var(--fc-ok-bg);
+  --warn: var(--fc-warn);
+  --warn-bg: var(--fc-warn-bg);
+  --danger: var(--fc-danger);
+  --danger-bg: var(--fc-danger-bg);
+  --chart-blue: #1d6fb8;
   --chart-orange: #d97706;
-  --chart-teal: #0d9488;
-  --sidebar-w: 240px;
-  --radius: 8px;
+  --chart-teal: var(--fc-accent);
+  --sidebar-w: var(--fc-sidebar-w);
+  --radius: var(--fc-radius);
   --radius-pill: 999px;
-  --font: "Geist", "Segoe UI", sans-serif;
-  --font-mono: "Geist Mono", ui-monospace, monospace;
+  --font: var(--fc-font);
+  --font-mono: var(--fc-font-mono);
   color-scheme: light;
 }
 
@@ -992,9 +995,9 @@ textarea {
 /* Public status / privacy pages */
 .public-page {
   min-height: 100%;
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--font);
+  background: var(--fc-paper);
+  color: var(--fc-ink);
+  font-family: var(--fc-font);
 }
 
 .public-page-header {
@@ -1002,12 +1005,14 @@ textarea {
   align-items: center;
   justify-content: space-between;
   padding: 16px 24px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--fc-line);
+  background: color-mix(in srgb, var(--fc-paper) 92%, transparent);
 }
 
 .public-brand {
-  font-weight: 600;
-  color: var(--text);
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  color: var(--fc-ink);
   text-decoration: none;
 }
 
@@ -1017,12 +1022,12 @@ textarea {
 }
 
 .public-page-header a {
-  color: var(--text-secondary);
+  color: var(--fc-mute);
   text-decoration: none;
 }
 
 .public-page-header a:hover {
-  color: var(--accent);
+  color: var(--fc-accent);
 }
 
 .public-page-main {
@@ -1031,8 +1036,12 @@ textarea {
   padding: 32px 24px 64px;
 }
 
+.public-page-main h1 {
+  letter-spacing: -0.03em;
+}
+
 .public-lede {
-  color: var(--text-secondary);
+  color: var(--fc-mute);
   line-height: 1.5;
 }
 

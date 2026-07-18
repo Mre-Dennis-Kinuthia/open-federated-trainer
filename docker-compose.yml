@@ -44,6 +44,8 @@ services:
       - CLIENT_NAME=${CLIENT_NAME:-}
       - CLIENT_API_KEY=${CLIENT_API_KEY:-}
       - DATASET_PATH=${DATASET_PATH:-}
+      # Local compose demo: synthetic features when no DATASET_PATH is mounted.
+      - ALLOW_SYNTHETIC_DATA=${ALLOW_SYNTHETIC_DATA:-true}
       - MAX_RETRIES=3
       - SLEEP_BETWEEN_ROUNDS=5.0
       - RETRY_DELAY=2.0

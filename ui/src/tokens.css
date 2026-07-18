@@ -1,0 +1,24 @@
+/*
+  Shared brand tokens — landing, public pages, and operator console.
+  Cool slate ground (not cream paper) + Figtree only for one visual system.
+*/
+:root {
+  --fc-paper: #e8ecf1;
+  --fc-paper-2: #dfe4eb;
+  --fc-ink: #0a1020;
+  --fc-mute: #5a6578;
+  --fc-line: #c8d0dc;
+  --fc-stage: #060a12;
+  --fc-accent: #0f6b5c;
+  --fc-accent-soft: #d7ebe6;
+  --fc-danger: #b42318;
+  --fc-danger-bg: #fdecea;
+  --fc-warn: #8a4f00;
+  --fc-warn-bg: #fff6e5;
+  --fc-ok: #0a7b45;
+  --fc-ok-bg: #e8f8ef;
+  --fc-font: "Figtree", "Segoe UI", sans-serif;
+  --fc-font-mono: ui-monospace, "Cascadia Code", "Segoe UI Mono", monospace;
+  --fc-radius: 6px;
+  --fc-sidebar-w: 240px;
+}

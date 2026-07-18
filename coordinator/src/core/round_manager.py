@@ -8,10 +8,35 @@ Classic rounds are persisted via an optional RoundRepository (JSON or SQL).
 from enum import Enum
 from typing import Dict, Set, Optional, Any
 from dataclasses import dataclass, field
+import os
 
 from utils.logger import get_logger
 
 logger = get_logger("round_manager")
+
+
+def _async_rounds_enabled() -> bool:
+    return os.getenv("ENABLE_ASYNC_ROUNDS", "true").lower() in {"1", "true", "yes"}
+
+
+def _async_min_updates() -> int:
+    try:
+        return max(1, int(os.getenv("ASYNC_MIN_UPDATES", "2")))
+    except ValueError:
+        return 2
+
+
+def _round_still_accepts_clients(round_obj: "Round") -> bool:
+    """True if more clients may join this COLLECTING/OPEN round."""
+    n_updates = len(round_obj.updates_received)
+    n_assigned = len(round_obj.assigned_clients)
+    if _async_rounds_enabled():
+        # Keep the round open until async min-updates (or max duration elsewhere).
+        return n_updates < _async_min_updates()
+    # Sync: close join once every assigned client has submitted.
+    if n_assigned == 0:
+        return True
+    return n_updates < n_assigned
 
 
 class RoundState(Enum):
@@ -226,29 +251,24 @@ class RoundManager:
             assigned_round_id = self.client_round_assignments[client_id]
             assigned_round = self.rounds.get(assigned_round_id)
             if assigned_round:
-                # If round is complete (all updates received), clear assignment
-                if len(assigned_round.updates_received) >= len(assigned_round.assigned_clients) and len(assigned_round.assigned_clients) > 0:
-                    # Round is complete, clear assignment
+                if client_id in assigned_round.updates_received:
+                    # Already contributed — free them for the next open round.
                     del self.client_round_assignments[client_id]
                 elif assigned_round.state in [RoundState.OPEN, RoundState.COLLECTING]:
-                    # Round is still active and not complete
-                    # Verify model version matches
                     if assigned_round.model_version == model_version:
                         return None
-                    else:
-                        # Model version mismatch, clear assignment
-                        del self.client_round_assignments[client_id]
+                    del self.client_round_assignments[client_id]
         
         # Find or create an active round with matching model version
         active_round = None
         for round_id, round_obj in self.rounds.items():
             if round_obj.state in [RoundState.OPEN, RoundState.COLLECTING]:
-                # Must match model version
                 if round_obj.model_version != model_version:
                     continue
-                # Check if all assigned clients have submitted updates
-                if len(round_obj.updates_received) >= len(round_obj.assigned_clients) and len(round_obj.assigned_clients) > 0:
-                    # All clients have submitted, skip this round and create a new one
+                if not _round_still_accepts_clients(round_obj):
+                    continue
+                # Don't re-join a round this client already updated.
+                if client_id in round_obj.updates_received:
                     continue
                 active_round = round_obj
                 break
